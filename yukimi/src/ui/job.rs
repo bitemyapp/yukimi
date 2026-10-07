@@ -172,13 +172,7 @@ pub fn run(ctx: &Ctx, operation: Operation) {
     let (sender, receiver) = async_channel::unbounded::<Event>();
     let command = operation.command(&ctx.nixpkgs_ref());
     let streaming = stop.clone();
-    let system = operation.is_system();
     std::thread::spawn(move || {
-        // Permission first, so that one password covers the next few changes.
-        if system && matches!(crate::polkit::authorize(), crate::polkit::Answer::Refused) {
-            let _ = sender.send_blocking(Event::Done(Err("Request dismissed".to_owned())));
-            return;
-        }
         let mut last = Instant::now() - Duration::from_secs(1);
         let result = nix::stream(command, &streaming, |progress| {
             // Plenty for the eye, without flooding the interface.

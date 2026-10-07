@@ -88,8 +88,9 @@ On NixOS, add the flake as an input and import its module:
 }
 ```
 
-The module installs the app with its polkit policy. With the policy in place,
-one administrator password covers a few minutes of changes.
+The module installs the app with its polkit policy, so the password prompt
+says what Yukimi is asking for. NixOS restarts polkit whenever the installed
+packages change, so each change asks for the password again.
 
 ## Licence
 

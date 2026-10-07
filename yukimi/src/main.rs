@@ -7,7 +7,6 @@ use adw::prelude::*;
 
 mod model;
 mod ops;
-mod polkit;
 mod ui;
 
 const APP_ID: &str = "io.github.bitemyapp.Yukimi";

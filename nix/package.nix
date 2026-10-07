@@ -45,7 +45,7 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     install -Dm644 yukimi/data/io.github.bitemyapp.Yukimi.desktop -t $out/share/applications
     install -Dm644 yukimi/data/io.github.bitemyapp.Yukimi.svg -t $out/share/icons/hicolor/scalable/apps
-    # Names this exact helper, so one password covers a few minutes of changes.
+    # Names this exact helper, so polkit's prompt says what Yukimi is asking for.
     mkdir -p $out/share/polkit-1/actions
     substitute yukimi-helper/data/io.github.bitemyapp.Yukimi.policy.in \
       $out/share/polkit-1/actions/io.github.bitemyapp.Yukimi.policy --subst-var out
