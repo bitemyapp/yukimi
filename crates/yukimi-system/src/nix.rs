@@ -2,7 +2,8 @@
 //! Running Nix: quick queries that return JSON, and long operations whose
 //! progress streams through [`crate::log::Progress`].
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use crate::log::Progress;
 
@@ -35,6 +36,12 @@ pub fn json(args: &[&str]) -> Result<serde_json::Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+/// One of Nix's settings, as `nix config show` gives it.
+pub fn setting(name: &str) -> Option<String> {
+    let output = command().args(["config", "show", name]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// The useful part of Nix's error output: from the last `error:` on.
 pub fn last_error(stderr: &str) -> String {
     match stderr.rfind("error:") {
@@ -43,17 +50,61 @@ pub fn last_error(stderr: &str) -> String {
     }
 }
 
+/// A way to stop a [`stream`]ed program. Its standard input is a pipe, and
+/// stopping closes it, which Yukimi's helper takes as the request to stop
+/// cleanly; a program of this user's own is also sent SIGTERM.
+#[derive(Clone, Default)]
+pub struct Stop(Arc<Mutex<StopState>>);
+
+#[derive(Default)]
+struct StopState {
+    requested: bool,
+    signal: bool,
+    stdin: Option<ChildStdin>,
+    pid: Option<u32>,
+}
+
+impl Stop {
+    /// `signal`: also send SIGTERM, for programs running as this user.
+    pub fn new(signal: bool) -> Stop {
+        Stop(Arc::new(Mutex::new(StopState { signal, ..StopState::default() })))
+    }
+
+    pub fn request(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.requested = true;
+        state.stdin = None;
+        if let (true, Some(pid)) = (state.signal, state.pid) {
+            // SAFETY: signalling a process has no memory-safety preconditions.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }
+    }
+
+    pub fn requested(&self) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).requested
+    }
+}
+
 /// Run a program that speaks Nix's progress log on its error output,
 /// calling `update` with the progress after each event. Returns its
 /// standard output.
-pub fn stream(mut command: Command, mut update: impl FnMut(&Progress)) -> Result<(String, Progress)> {
+pub fn stream(mut command: Command, stop: &Stop, mut update: impl FnMut(&Progress)) -> Result<(String, Progress)> {
     let program = command.get_program().to_string_lossy().into_owned();
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::Spawn(program, e))?;
+    let mut child = {
+        let mut state = stop.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.requested {
+            return Err(Error::Failed("Stopped".into()));
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Spawn(program, e))?;
+        state.stdin = child.stdin.take();
+        state.pid = Some(child.id());
+        child
+    };
     let stdout = child.stdout.take().expect("piped");
     let reader = std::thread::spawn(move || {
         let mut out = String::new();
@@ -67,6 +118,11 @@ pub fn stream(mut command: Command, mut update: impl FnMut(&Progress)) -> Result
         }
     }
     let status = child.wait().map_err(|e| Error::Spawn("nix".into(), e))?;
+    {
+        let mut state = stop.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.pid = None;
+        state.stdin = None;
+    }
     let out = reader.join().unwrap_or_default();
     if !status.success() {
         let message = progress
@@ -77,6 +133,25 @@ pub fn stream(mut command: Command, mut update: impl FnMut(&Progress)) -> Result
         return Err(Error::Failed(message));
     }
     Ok((out, progress))
+}
+
+/// What updating the system flake would bring, without changing it:
+/// `nix flake update` writes its lock file to `output` instead. It needs no
+/// administrator, and what it downloads is reused by the real update.
+pub fn check_updates(config_dir: &str, output: &std::path::Path) -> Result<()> {
+    let result = command()
+        .args(["flake", "update", "--flake", &format!("path:{config_dir}"), "--output-lock-file"])
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| Error::Spawn("nix".into(), e))?;
+    if !result.status.success() {
+        let stderr = crate::log::strip_ansi(&String::from_utf8_lossy(&result.stderr));
+        return Err(Error::Failed(last_error(&stderr)));
+    }
+    Ok(())
 }
 
 /// Store paths of the system flake's inputs Yukimi reads from: Nixpkgs and
@@ -116,12 +191,47 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", r#"echo '@nix {"action":"msg","level":1,"msg":"warning: hello"}' >&2; echo result"#]);
         let mut updates = 0;
-        let (out, progress) = stream(command, |_| updates += 1).unwrap();
+        let (out, progress) = stream(command, &Stop::default(), |_| updates += 1).unwrap();
         assert_eq!(out.trim(), "result");
         assert_eq!(updates, 1);
         assert_eq!(progress.messages[0].text, "warning: hello");
         let mut failing = Command::new("sh");
         failing.args(["-c", r#"echo '@nix {"action":"msg","level":0,"msg":"error: nope"}' >&2; exit 1"#]);
-        assert_eq!(stream(failing, |_| {}).unwrap_err().to_string(), "error: nope");
+        assert_eq!(stream(failing, &Stop::default(), |_| {}).unwrap_err().to_string(), "error: nope");
+    }
+
+    #[test]
+    fn stopping_closes_input_or_signals() {
+        // The helper's way: it notices its input close, and says so.
+        let mut polite = Command::new("sh");
+        polite.args([
+            "-c",
+            r#"cat >/dev/null; echo '@nix {"action":"msg","level":0,"msg":"error: Stopped"}' >&2; exit 1"#,
+        ]);
+        let stop = Stop::new(false);
+        let later = stop.clone();
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            later.request();
+        });
+        assert_eq!(stream(polite, &stop, |_| {}).unwrap_err().to_string(), "error: Stopped");
+        timer.join().unwrap();
+        assert!(stop.requested());
+
+        // A program of this user's own that ignores its input is signalled.
+        let mut stubborn = Command::new("sleep");
+        stubborn.arg("30");
+        let stop = Stop::new(true);
+        let later = stop.clone();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            later.request();
+        });
+        assert!(stream(stubborn, &stop, |_| {}).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        // Once stopped, nothing more starts.
+        assert!(stream(Command::new("true"), &stop, |_| {}).is_err());
     }
 }

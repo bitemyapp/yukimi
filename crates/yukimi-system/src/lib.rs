@@ -23,6 +23,15 @@ pub mod profile;
 /// The directory a NixOS system is configured in.
 pub const CONFIG_DIR: &str = "/etc/nixos";
 
+/// Where Yukimi's helper keeps a copy of the configuration each system
+/// generation was built from, as `generation-<n>`.
+pub const SAVED_CONFIGURATIONS: &str = "/var/lib/yukimi/configurations";
+
+/// The copy of generation `generation`'s configuration.
+pub fn saved_configuration(generation: u32) -> std::path::PathBuf {
+    std::path::Path::new(SAVED_CONFIGURATIONS).join(format!("generation-{generation}"))
+}
+
 /// Bytes as a person reads them: `1.4 GB`, `312 MB`, `40 kB`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];

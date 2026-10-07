@@ -80,8 +80,6 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
             row.add_suffix(&remove);
             apps.add(&row);
         }
-        content.append(&apps);
-
         // Added for everyone with Yukimi.
         let everyone = adw::PreferencesGroup::new();
         everyone.set_title("Added for everyone");
@@ -118,8 +116,6 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
             row.add_suffix(&remove);
             everyone.add(&row);
         }
-        content.append(&everyone);
-
         // The user's own profile.
         let mine = adw::PreferencesGroup::new();
         mine.set_title("Just for you");
@@ -146,7 +142,15 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
             row.add_suffix(&remove);
             mine.add(&row);
         }
-        content.append(&mine);
+        // What was added since installing comes first, once there is some.
+        let order = if model.yukimi_packages.is_empty() && model.user_packages.is_empty() {
+            [&apps, &everyone, &mine]
+        } else {
+            [&everyone, &mine, &apps]
+        };
+        for group in order {
+            content.append(group);
+        }
 
         // Everything else the system has.
         let system = adw::PreferencesGroup::new();

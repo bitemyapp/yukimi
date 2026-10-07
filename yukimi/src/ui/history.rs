@@ -86,9 +86,15 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
                 }
                 let model = ctx2.model();
                 if !this.current {
+                    // Whether its configuration was kept, so it comes back too.
+                    let kept = yukimi_system::saved_configuration(this.number).is_dir();
                     let back = adw::ActionRow::new();
                     back.set_title("Return to this version");
-                    back.set_subtitle("Switch the running system to this generation. The newer ones stay too.");
+                    back.set_subtitle(if kept {
+                        "The running system and your choices go back to this generation. The newer ones stay too."
+                    } else {
+                        "The running system goes back to this generation. The newer ones stay too."
+                    });
                     let button = gtk::Button::with_label("Return");
                     button.add_css_class("pill");
                     button.set_valign(gtk::Align::Center);
@@ -96,8 +102,15 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
                     button.connect_clicked(move |_| {
                         ctx3.confirm(
                             &format!("Return to generation {number}?"),
-                            "The running system switches to this version, after an administrator password. \
-                             Newer generations are kept, so you can come back.",
+                            if kept {
+                                "The running system switches to this version, after an administrator password, and \
+                                 your choices go back to what they were then. Newer generations are kept, so you can \
+                                 come back."
+                            } else {
+                                "The running system switches to this version, after an administrator password. \
+                                 Yukimi didn't keep the choices it was made from, so your next change builds on \
+                                 today's choices. Newer generations are kept, so you can come back."
+                            },
                             "Return",
                             Operation::Rollback { generation: number },
                         );

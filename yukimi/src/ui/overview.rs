@@ -2,6 +2,7 @@
 //! The first page: this computer, its packages, how fresh it is, and how
 //! much room the store takes, at a glance.
 use adw::prelude::*;
+use yukimi_config::lock::{Movement, compare};
 use yukimi_system::diff::{self, ChangeKind};
 use yukimi_system::{human_age, human_size, now};
 
@@ -116,6 +117,8 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
 
         let cards = gtk::Box::new(gtk::Orientation::Horizontal, 18);
         cards.set_homogeneous(true);
+        // The cards share a height, but don't stretch to fill the window.
+        cards.set_vexpand(false);
         let chosen = model.applications.len() + model.yukimi_packages.len();
         cards.append(&card(
             "view-grid-symbolic",
@@ -135,7 +138,21 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
             "software-update-available-symbolic",
             "Freshness",
             &newest.map(|t| human_age(t, now())).unwrap_or_else(|| "—".to_owned()),
-            "since the version of Nixpkgs your system is built from was published.",
+            &{
+                let mut line = "since the version of Nixpkgs your system is built from was published.".to_owned();
+                if let Some(check) = ctx.update_check() {
+                    let newer = compare(&model.inputs, &check.inputs)
+                        .values()
+                        .filter(|m| matches!(m, Movement::Newer(_)))
+                        .count();
+                    line.push_str(&match newer {
+                        0 => " Everything was up to date when last checked.".to_owned(),
+                        1 => " One source has a newer version.".to_owned(),
+                        n => format!(" {n} sources have newer versions."),
+                    });
+                }
+                line
+            },
             ("See updates", "updates"),
             ctx,
         ));
@@ -197,6 +214,20 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
             go.connect_clicked(move |_| ctx.show("history"));
             row.add_suffix(&go);
             row.set_activatable_widget(Some(&go));
+            group.add(&row);
+            content.append(&group);
+        } else if let Some(only) = model.generations.last() {
+            let group = adw::PreferencesGroup::new();
+            group.set_title("Most recently");
+            let row = adw::ActionRow::new();
+            row.set_title("The system as it was installed");
+            row.set_subtitle(&format!(
+                "Generation {} was built {}. Each change you make becomes a new generation, and what it changed \
+                 shows up here.",
+                only.number,
+                human_age(only.created, now())
+            ));
+            row.add_prefix(&gtk::Image::from_icon_name("document-open-recent-symbolic"));
             group.add(&row);
             content.append(&group);
         }

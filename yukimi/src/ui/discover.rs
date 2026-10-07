@@ -15,6 +15,18 @@ use crate::ops::{self, Mode, Operation};
 
 const RESULTS: usize = 80;
 
+/// Whether the running system has this package. The index knows names, not
+/// store paths, and variants share a name (`btop`, `btop-cuda` and
+/// `btop-rocm` are all btop), so a name and version match counts only for
+/// the attribute named after the package, or for the only one there is.
+fn on_system(ctx: &Ctx, package: &Package) -> bool {
+    let model = ctx.model();
+    let matches = model.system_packages.iter().any(|p| p.name == package.pname && p.version == package.version);
+    let canonical = package.attr == package.pname
+        || ctx.index().is_none_or(|index| index.get(&package.pname).is_none_or(|p| p.version != package.version));
+    matches && canonical
+}
+
 /// Badges for what a package is and whether it is installed.
 fn badges(ctx: &Ctx, package: &Package) -> gtk::Box {
     let model = ctx.model();
@@ -25,7 +37,7 @@ fn badges(ctx: &Ctx, package: &Package) -> gtk::Box {
     if model.user_attrs().contains(package.attr.as_str()) {
         row.append(&badge("for you", "installed"));
     }
-    if model.system_names().contains(package.pname.as_str()) {
+    if on_system(ctx, package) {
         row.append(&badge("on your system", "system"));
     }
     if package.unfree {
@@ -49,8 +61,8 @@ fn install_for_everyone(ctx: &Ctx, attr: &str) {
     packages.push(attr.to_owned());
     ctx.confirm(
         &format!("Install {attr} for everyone?"),
-        "Yukimi adds it to the system configuration (/etc/nixos/yukimi.nix) and builds the new system, which asks \
-         for an administrator password and can take a few minutes. The current version stays in History.",
+        "Yukimi adds it to the system configuration and builds the new system, which asks for an administrator \
+         password and can take a few minutes. The current version stays in History.",
         "Install",
         Operation::ChangeSystem { packages: Some(packages), applications: None, update: vec![], mode: Mode::Switch },
     );
@@ -88,13 +100,17 @@ fn details(ctx: &Ctx, package: &Package) {
     content.set_margin_end(24);
 
     let top = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-    top.append(&monogram(&package.pname, 64));
+    top.append(&monogram(&package.attr, 64));
     let names = gtk::Box::new(gtk::Orientation::Vertical, 2);
     names.set_valign(gtk::Align::Center);
-    let title = gtk::Label::new(Some(&package.pname));
+    let title = gtk::Label::new(Some(&package.attr));
     title.add_css_class("title-1");
     title.set_xalign(0.0);
-    let attr = dim(&format!("{}  ·  {}", package.attr, package.version));
+    let attr = dim(&if package.pname == package.attr {
+        package.version.clone()
+    } else {
+        format!("{} {}", package.pname, package.version)
+    });
     attr.set_xalign(0.0);
     names.append(&title);
     names.append(&attr);
@@ -172,14 +188,14 @@ fn details(ctx: &Ctx, package: &Package) {
         .child(&content)
         .build();
     view.set_content(Some(&scroll));
-    let dialog = adw::Dialog::builder().title(&package.pname).content_width(560).child(&view).build();
+    let dialog = adw::Dialog::builder().title(&package.attr).content_width(560).child(&view).build();
 
     {
         let (ctx, package) = (ctx.clone(), package.clone());
         try_it.connect_clicked(move |_| {
             let command = ops::try_command(&ctx.nixpkgs_ref(), &package.attr, &package.main_program, package.unfree);
             match ops::open_terminal(&command) {
-                Ok(()) => ctx.toast(&format!("Trying {} in a terminal", package.pname)),
+                Ok(()) => ctx.toast(&format!("Trying {} in a terminal", package.attr)),
                 Err(e) => ctx.toast(&e),
             }
         });
@@ -199,14 +215,20 @@ fn details(ctx: &Ctx, package: &Package) {
         });
     }
     dialog.present(Some(ctx.window()));
+    // Start on the buttons, not inside the facts.
+    if for_all.is_sensitive() {
+        for_all.grab_focus();
+    } else {
+        try_it.grab_focus();
+    }
 }
 
 fn result_row(ctx: &Ctx, package: &Package) -> adw::ActionRow {
     let row = adw::ActionRow::new();
-    row.set_title(&gtk::glib::markup_escape_text(&package.pname));
+    row.set_title(&gtk::glib::markup_escape_text(&package.attr));
     row.set_subtitle(&gtk::glib::markup_escape_text(&package.description));
     row.set_subtitle_lines(2);
-    row.add_prefix(&monogram(&package.pname, 40));
+    row.add_prefix(&monogram(&package.attr, 40));
     row.add_suffix(&badges(ctx, package));
     row.add_suffix(&dim(&package.version));
     row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
@@ -332,7 +354,10 @@ pub fn build(ctx: &Ctx) -> gtk::Box {
                     flow.set_max_children_per_line(4);
                     flow.set_column_spacing(12);
                     flow.set_row_spacing(12);
-                    for app in model.catalog.iter().filter(|a| a.category == category) {
+                    // What isn't installed yet comes first.
+                    let mut apps: Vec<&Application> = model.catalog.iter().filter(|a| a.category == category).collect();
+                    apps.sort_by_key(|a| model.applications.contains(&a.id));
+                    for app in apps {
                         flow.append(&app_card(ctx, app));
                     }
                     content.append(&flow);

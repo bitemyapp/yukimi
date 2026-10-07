@@ -75,6 +75,22 @@ impl Operation {
         }
     }
 
+    /// What to say when it worked, given what the helper reported.
+    pub fn outcome(&self, out: &str) -> String {
+        let report: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_default();
+        match self {
+            Operation::Rollback { generation } if report["configuration"] == false => format!(
+                "Generation {generation} is running. Its configuration wasn't kept, so your next change builds on \
+                 the newer one"
+            ),
+            Operation::Clean { .. } => match report["freed"].as_str() {
+                Some(freed) if !freed.is_empty() => format!("The store is tidy: {freed}"),
+                _ => self.done(),
+            },
+            _ => self.done(),
+        }
+    }
+
     /// Whether this changes the whole system (and asks for a password).
     pub fn is_system(&self) -> bool {
         !matches!(self, Operation::InstallForMe { .. } | Operation::RemoveForMe { .. })

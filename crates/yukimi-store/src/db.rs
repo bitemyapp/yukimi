@@ -188,6 +188,13 @@ impl Graph {
 
     /// Everything the roots need, the roots included.
     pub fn closure(&self, roots: impl IntoIterator<Item = PathId>) -> Vec<PathId> {
+        self.kept(roots, false)
+    }
+
+    /// Everything the roots keep from garbage collection: their closure and,
+    /// with Nix's `keep-derivations` setting (on by default), the derivation
+    /// that built each kept path, with everything that derivation needs.
+    pub fn kept(&self, roots: impl IntoIterator<Item = PathId>, keep_derivations: bool) -> Vec<PathId> {
         let mut seen = vec![false; self.nodes.len()];
         let mut stack: Vec<PathId> = Vec::new();
         let mut out = Vec::new();
@@ -202,6 +209,12 @@ impl Graph {
                 if !std::mem::replace(&mut seen[next.index()], true) {
                     stack.push(next);
                 }
+            }
+            if keep_derivations
+                && let Some(deriver) = self.info(id).deriver.as_deref().and_then(|d| self.index.get(d))
+                && !std::mem::replace(&mut seen[deriver.index()], true)
+            {
+                stack.push(*deriver);
             }
         }
         out
@@ -249,11 +262,11 @@ impl Graph {
         None
     }
 
-    /// Paths no root needs: what garbage collection would remove (apart
+    /// Paths no root keeps: what garbage collection would remove (apart
     /// from paths that running programs hold open, which only root can see).
-    pub fn dead(&self, roots: impl IntoIterator<Item = PathId>) -> Vec<PathId> {
+    pub fn dead(&self, roots: impl IntoIterator<Item = PathId>, keep_derivations: bool) -> Vec<PathId> {
         let mut live = vec![false; self.nodes.len()];
-        for id in self.closure(roots) {
+        for id in self.kept(roots, keep_derivations) {
             live[id.index()] = true;
         }
         self.ids().filter(|id| !live[id.index()]).collect()
@@ -297,9 +310,21 @@ mod tests {
         assert_eq!(g.size(&closure), 133);
         assert_eq!(g.referrers(PathId(2)).len(), 3);
         assert!(g.references(PathId(1)).iter().all(|&id| id != PathId(1)));
-        let dead = g.dead([PathId(0)]);
+        let dead = g.dead([PathId(0)], false);
         assert_eq!(dead, vec![PathId(4), PathId(5)]);
         assert_eq!(g.total_size(), 239);
+    }
+
+    #[test]
+    fn derivations_kept_with_their_outputs() {
+        // 0 system -> 1 hello; 1 was built by 2 hello.drv, which needs 3 the source.
+        let mut nodes =
+            vec![info("nixos-system", 1), info("hello-2.12", 10), info("hello-2.12.drv", 1), info("src", 5)];
+        nodes[1].deriver = Some(nodes[2].path.clone());
+        let g = Graph::from_parts(nodes, &[(0, 1), (2, 3)]);
+        assert_eq!(g.dead([PathId(0)], false), vec![PathId(2), PathId(3)]);
+        assert!(g.dead([PathId(0)], true).is_empty());
+        assert_eq!(g.closure([PathId(0)]).len(), 2);
     }
 
     #[test]

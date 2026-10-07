@@ -85,7 +85,10 @@ impl Model {
             Ok(graph) => model.graph = graph,
             Err(e) => model.problems.push(format!("The store database could not be read: {e}")),
         }
-        model.composition = composition(&model.graph, &model.roots);
+        // The garbage collector keeps derivations of live paths unless told
+        // not to; Nix's default is to keep them.
+        let keep_derivations = nix::setting("keep-derivations").is_none_or(|value| value != "false");
+        model.composition = composition(&model.graph, &model.roots, keep_derivations);
         model.system_packages = system_packages(&model.graph);
         model.heaviest = heaviest(&model.graph, 24);
         model.read_configuration();
@@ -145,10 +148,6 @@ impl Model {
     }
 
     /// Names of packages the running system has, for marking search results.
-    pub fn system_names(&self) -> BTreeSet<&str> {
-        self.system_packages.iter().map(|p| p.name.as_str()).collect()
-    }
-
     /// Attributes the current user installed.
     pub fn user_attrs(&self) -> BTreeSet<&str> {
         self.user_packages.iter().filter_map(|e| e.package_attr()).collect()
@@ -164,7 +163,7 @@ fn ids(graph: &Graph, roots: &[&Root]) -> Vec<PathId> {
     roots.iter().filter_map(|r| graph.lookup(r.target.as_str())).collect()
 }
 
-fn composition(graph: &Graph, roots: &[Root]) -> Composition {
+fn composition(graph: &Graph, roots: &[Root], keep_derivations: bool) -> Composition {
     let mut owner: Vec<u8> = vec![0; graph.len()];
     let groups: [(u8, Vec<&Root>); 4] = [
         (1, roots.iter().filter(|r| matches!(r.kind, RootKind::CurrentSystem | RootKind::BootedSystem)).collect()),
@@ -186,7 +185,7 @@ fn composition(graph: &Graph, roots: &[Root]) -> Composition {
         if *tag == 1 {
             start.extend(current);
         }
-        for id in graph.closure(start) {
+        for id in graph.kept(start, keep_derivations) {
             if owner[id.index()] == 0 {
                 owner[id.index()] = *tag;
             }

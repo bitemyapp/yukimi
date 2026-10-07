@@ -36,10 +36,20 @@ enum Event {
     Done(Result<String, String>),
 }
 
+/// How long Nix may say nothing before the dialog mentions it.
+const QUIET: Duration = Duration::from_secs(180);
+
 /// Words for failures a person can act on.
-fn explain(error: &str, system: bool) -> String {
+fn explain(error: &str, system: bool, stopped: bool) -> String {
     if error.contains("dismissed") || error.contains("Not authorized") || error.contains("126") {
         return "Cancelled. Nothing was changed.".to_owned();
+    }
+    if stopped {
+        return if system {
+            "Stopped. Your configuration was put back as it was, and the running system was not changed.".to_owned()
+        } else {
+            "Stopped. Nothing was changed.".to_owned()
+        };
     }
     if system {
         format!("{error}\n\nYour configuration was put back as it was, and the running system was not changed.")
@@ -81,16 +91,28 @@ pub fn run(ctx: &Ctx, operation: Operation) {
     let details = gtk::Expander::new(Some("Details"));
     details.set_child(Some(&log_scroll));
 
+    let quiet = super::widgets::wrapping(
+        "Nix hasn't reported anything for a few minutes. It may be waiting on a slow download. You can wait, or \
+         stop and try again later.",
+        &["dim-label"],
+    );
+    quiet.set_visible(false);
+
     let close = gtk::Button::with_label("Close");
     close.add_css_class("pill");
     close.set_halign(gtk::Align::Center);
     close.set_visible(false);
+    let stop_button = gtk::Button::with_label("Stop");
+    stop_button.add_css_class("pill");
+    stop_button.set_halign(gtk::Align::Center);
 
     content.append(&status);
     content.append(&bar);
     content.append(&summary);
+    content.append(&quiet);
     content.append(&error);
     content.append(&details);
+    content.append(&stop_button);
     content.append(&close);
 
     let view = adw::ToolbarView::new();
@@ -123,11 +145,36 @@ pub fn run(ctx: &Ctx, operation: Operation) {
         });
     }
 
+    // Stopping: the helper (as root) is asked through its input; this
+    // user's own Nix is also signalled.
+    let stop = nix::Stop::new(!operation.is_system());
+    {
+        let (stop, status) = (stop.clone(), status.clone());
+        stop_button.connect_clicked(move |button| {
+            stop.request();
+            button.set_sensitive(false);
+            status.set_text("Stopping…");
+        });
+    }
+    // Mention it when Nix goes quiet for long.
+    let heard = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+    {
+        let (heard, quiet, running) = (heard.clone(), quiet.clone(), stop_button.clone());
+        glib::timeout_add_seconds_local(5, move || {
+            if !running.is_visible() {
+                return glib::ControlFlow::Break;
+            }
+            quiet.set_visible(heard.get().elapsed() >= QUIET);
+            glib::ControlFlow::Continue
+        });
+    }
+
     let (sender, receiver) = async_channel::unbounded::<Event>();
     let command = operation.command(&ctx.nixpkgs_ref());
+    let streaming = stop.clone();
     std::thread::spawn(move || {
         let mut last = Instant::now() - Duration::from_secs(1);
-        let result = nix::stream(command, |progress| {
+        let result = nix::stream(command, &streaming, |progress| {
             // Plenty for the eye, without flooding the interface.
             if last.elapsed() >= Duration::from_millis(100) {
                 last = Instant::now();
@@ -149,7 +196,11 @@ pub fn run(ctx: &Ctx, operation: Operation) {
         while let Ok(event) = receiver.recv().await {
             match event {
                 Event::Progress(snapshot) => {
-                    status.set_text(&snapshot.current.unwrap_or_else(|| "Working…".to_owned()));
+                    heard.set(Instant::now());
+                    quiet.set_visible(false);
+                    if !stop.requested() {
+                        status.set_text(&snapshot.current.unwrap_or_else(|| "Working…".to_owned()));
+                    }
                     summary.set_text(&snapshot.summary);
                     if let Some(fraction) = snapshot.fraction {
                         pulsing.set(false);
@@ -163,11 +214,13 @@ pub fn run(ctx: &Ctx, operation: Operation) {
                 Event::Done(result) => {
                     pulsing.set(false);
                     dialog.set_can_close(true);
+                    stop_button.set_visible(false);
+                    quiet.set_visible(false);
                     match result {
-                        Ok(_) => {
+                        Ok(out) => {
                             bar.set_fraction(1.0);
                             status.set_text(&operation.done());
-                            ctx.toast(&operation.done());
+                            ctx.toast(&operation.outcome(&out));
                             ctx.reload();
                             let dialog = dialog.clone();
                             glib::timeout_add_local_once(Duration::from_millis(900), move || {
@@ -175,8 +228,8 @@ pub fn run(ctx: &Ctx, operation: Operation) {
                             });
                         }
                         Err(message) => {
-                            status.set_text("That did not work");
-                            error.set_text(&explain(&message, operation.is_system()));
+                            status.set_text(if stop.requested() { "Stopped" } else { "That did not work" });
+                            error.set_text(&explain(&message, operation.is_system(), stop.requested()));
                             error.set_visible(true);
                             details.set_expanded(true);
                             close.set_visible(true);

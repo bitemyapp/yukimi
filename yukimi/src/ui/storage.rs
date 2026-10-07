@@ -99,13 +99,15 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
             "Everything installed lives in /nix/store, each version in its own folder, which is why several can \
              live side by side and why going back is instant. Here is what keeps each part of it.",
         ));
+        let size = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let total = gtk::Label::new(Some(&human_size(c.total)));
         total.add_css_class("stat-number");
         total.set_xalign(0.0);
         let paths = dim(&format!("in {} store paths", c.paths));
         paths.set_xalign(0.0);
-        content.append(&total);
-        content.append(&paths);
+        size.append(&total);
+        size.append(&paths);
+        content.append(&size);
         content.append(&composition_bar(c));
 
         let legend = adw::PreferencesGroup::new();

@@ -95,10 +95,31 @@ fn flakehub(url: &str) -> Option<String> {
     let parts: Vec<&str> = rest.split('/').collect();
     match parts.as_slice() {
         [owner, project, version, ..] => {
-            Some(format!("flakehub:{owner}/{project}/{}", version.trim_end_matches(".tar.gz")))
+            Some(format!("flakehub:{owner}/{project}/{}", unescape(version.trim_end_matches(".tar.gz"))))
         }
         _ => None,
     }
+}
+
+/// Undo URL escapes: FlakeHub's `*` (any version) is written `%2A`.
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
 }
 
 /// One of the root's inputs.
@@ -114,6 +135,43 @@ pub struct Input {
     /// Root inputs that this input's own inputs follow, such as `nixpkgs`
     /// and `tatami` for `calamares`.
     pub follows_inputs: Vec<String>,
+}
+
+/// How updating an input would move it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Movement {
+    /// It is already at the newest version.
+    Current,
+    /// There is a newer version.
+    Newer(Locked),
+    /// What `flake.nix` asks for now points at a version older than the one
+    /// locked (a branch was moved back, or the lock was made from somewhere
+    /// else), so updating would go back in time.
+    Older(Locked),
+}
+
+/// How each locked input in `current` would move, given `updated`: the same
+/// flake's inputs after `nix flake update`.
+pub fn compare(current: &[Input], updated: &[Input]) -> BTreeMap<String, Movement> {
+    current
+        .iter()
+        .filter_map(|input| {
+            let now = input.locked.as_ref()?;
+            let next = updated.iter().find(|u| u.name == input.name)?.locked.clone()?;
+            // The content hash decides; the revision when there is none.
+            let same = match (&now.nar_hash, &next.nar_hash, &now.rev, &next.rev) {
+                (Some(a), Some(b), _, _) => a == b,
+                (_, _, Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            let movement = match (now.last_modified, next.last_modified) {
+                _ if same => Movement::Current,
+                (Some(before), Some(after)) if after < before => Movement::Older(next),
+                _ => Movement::Newer(next),
+            };
+            Some((input.name.clone(), movement))
+        })
+        .collect()
 }
 
 /// A parsed `flake.lock`.
@@ -224,5 +282,46 @@ mod tests {
             Some("https://github.com/bitemyapp/tatami/commit/b925d7a9c9")
         );
         assert!(FlakeLock::parse("{}").is_err());
+    }
+
+    #[test]
+    fn updates_compared_with_the_lock() {
+        let current = FlakeLock::parse(LOCK).unwrap().inputs();
+        let updated = FlakeLock::parse(
+            &LOCK
+                // nixpkgs moved forward, calamares's branch moved back, tatami stayed.
+                .replace(
+                    "\"lastModified\": 1790600678, \"narHash\": \"sha256-y\"",
+                    "\"lastModified\": 1791000000, \"narHash\": \"sha256-z\"",
+                )
+                .replace(
+                    "\"lastModified\": 1791340000, \"narHash\": \"sha256-x\"",
+                    "\"lastModified\": 1790000000, \"narHash\": \"sha256-w\"",
+                )
+                .replace("0d10e385c48d2c5be463aeb839d73047dc770665", "0cbb39e2c42ab4b0a05690a7727dd69dea051545")
+                .replace("f45c6f04c2f013f004bf94e284e95d72898d9393", "a7868a7f9e0d2c5be463aeb839d73047dc770665"),
+        )
+        .unwrap()
+        .inputs();
+        let moves = compare(&current, &updated);
+        assert!(matches!(&moves["nixpkgs"], Movement::Newer(l) if l.last_modified == Some(1791000000)));
+        assert!(matches!(&moves["calamares"], Movement::Older(l) if l.short_rev() == Some("0cbb39e")));
+        assert_eq!(moves["tatami"], Movement::Current);
+        // Inputs that follow another have nothing of their own to move.
+        assert!(!moves.contains_key("pkgs"));
+    }
+
+    #[test]
+    fn flakehub_versions_unescaped() {
+        assert_eq!(
+            flakehub("https://flakehub.com/f/DeterminateSystems/fh/%2A.tar.gz").as_deref(),
+            Some("flakehub:DeterminateSystems/fh/*")
+        );
+        assert_eq!(
+            flakehub("https://api.flakehub.com/f/pinned/NixOS/nixpkgs/0.1.912345%2Brev-f45c6f04/0199/source.tar.gz")
+                .as_deref(),
+            Some("flakehub:NixOS/nixpkgs/0.1.912345+rev-f45c6f04")
+        );
+        assert_eq!(unescape("100%"), "100%");
     }
 }

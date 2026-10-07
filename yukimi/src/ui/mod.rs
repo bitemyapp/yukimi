@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
+use yukimi_config::lock::{FlakeLock, Input};
 use yukimi_system::index::PackageIndex;
 
 use crate::model::Model;
@@ -46,8 +47,48 @@ pub struct Inner {
     model: RefCell<Rc<Model>>,
     index: RefCell<Option<Rc<PackageIndex>>>,
     indexing: Cell<bool>,
+    updates: RefCell<Option<Rc<UpdateCheck>>>,
+    checking: Cell<bool>,
     loading: Cell<bool>,
     refreshers: RefCell<Vec<Refresh>>,
+}
+
+/// What checking for updates found: the system's inputs as `nix flake
+/// update` would lock them, and when it looked.
+pub struct UpdateCheck {
+    pub when: i64,
+    pub inputs: Vec<Input>,
+}
+
+/// Yukimi's cache directory, `~/.cache/yukimi`.
+fn cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("yukimi"))
+}
+
+/// Where the last check for updates keeps its lock file.
+fn check_file() -> Option<PathBuf> {
+    Some(cache_dir()?.join("updates").join("flake.lock"))
+}
+
+fn load_check(path: &std::path::Path) -> Option<UpdateCheck> {
+    let lock = FlakeLock::parse(&std::fs::read_to_string(path).ok()?).ok()?;
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let when = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(UpdateCheck { when, inputs: lock.inputs() })
+}
+
+/// Ask Nix for the newest version of every input, keeping the answer.
+fn run_check(path: &std::path::Path) -> Result<UpdateCheck, String> {
+    let dir = path.parent().ok_or("No cache directory")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let partial = dir.join("flake.lock.new");
+    let _ = std::fs::remove_file(&partial);
+    yukimi_system::nix::check_updates(yukimi_system::CONFIG_DIR, &partial).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, path).map_err(|e| e.to_string())?;
+    load_check(path).ok_or_else(|| "The newest versions could not be read".to_owned())
 }
 
 impl Ctx {
@@ -65,6 +106,38 @@ impl Ctx {
 
     pub fn indexing(&self) -> bool {
         self.0.indexing.get()
+    }
+
+    /// The last check for updates, if there has been one.
+    pub fn update_check(&self) -> Option<Rc<UpdateCheck>> {
+        self.0.updates.borrow().clone()
+    }
+
+    pub fn checking(&self) -> bool {
+        self.0.checking.get()
+    }
+
+    /// Look for newer versions of the system's inputs, in the background.
+    pub fn check_updates(&self) {
+        let Some(path) = check_file() else {
+            return;
+        };
+        if self.0.checking.replace(true) {
+            return;
+        }
+        self.refresh_all();
+        let ctx = self.clone();
+        glib::spawn_future_local(async move {
+            let checked = gio::spawn_blocking(move || run_check(&path))
+                .await
+                .unwrap_or_else(|_| Err("Checking for updates stopped unexpectedly".to_owned()));
+            ctx.0.checking.set(false);
+            match checked {
+                Ok(check) => *ctx.0.updates.borrow_mut() = Some(Rc::new(check)),
+                Err(e) => ctx.toast(&format!("Couldn't check for updates: {e}")),
+            }
+            ctx.refresh_all();
+        });
     }
 
     pub fn loading(&self) -> bool {
@@ -144,10 +217,7 @@ impl Ctx {
     fn index_cache(&self) -> Option<PathBuf> {
         let nixpkgs = self.model().nixpkgs.clone()?;
         let name = std::path::Path::new(&nixpkgs).file_name()?.to_string_lossy().into_owned();
-        let base = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-        Some(base.join("yukimi").join(format!("packages-{name}.json")))
+        Some(cache_dir()?.join(format!("packages-{name}.json")))
     }
 
     /// Load the package index from the cache, or build it (`build` forces a
@@ -244,6 +314,8 @@ pub fn build_window(app: &adw::Application) {
         model: RefCell::new(Rc::new(Model::default())),
         index: RefCell::new(None),
         indexing: Cell::new(false),
+        updates: RefCell::new(check_file().and_then(|path| load_check(&path)).map(Rc::new)),
+        checking: Cell::new(false),
         loading: Cell::new(false),
         refreshers: RefCell::new(Vec::new()),
     }));

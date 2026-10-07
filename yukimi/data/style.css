@@ -120,20 +120,24 @@
   color: #9c6d00;
 }
 
-.badge.broken,
-.badge.stale {
+.badge.broken {
   background-color: alpha(#e01b24, 0.15);
   color: #c01c28;
 }
 
-.badge.aging {
+.badge.backwards {
   background-color: alpha(#e5a50a, 0.2);
   color: #9c6d00;
 }
 
-.badge.fresh {
+.badge.uptodate {
   background-color: alpha(#2ec27e, 0.18);
   color: #1a7f50;
+}
+
+.badge.newer {
+  background-color: alpha(#3584e4, 0.16);
+  color: #1c71d8;
 }
 
 .badge.current {
@@ -147,10 +151,10 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  .badge.installed, .badge.fresh { color: #8ff0a4; }
-  .badge.system { color: #99c1f1; }
-  .badge.unfree, .badge.aging { color: #f8e45c; }
-  .badge.broken, .badge.stale { color: #ff7b63; }
+  .badge.installed, .badge.uptodate { color: #8ff0a4; }
+  .badge.system, .badge.newer { color: #99c1f1; }
+  .badge.unfree, .badge.backwards { color: #f8e45c; }
+  .badge.broken { color: #ff7b63; }
   .badge.booted { color: #dc8add; }
 }
 
