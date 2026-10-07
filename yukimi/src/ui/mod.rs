@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The window: a sidebar of places and the page for each.
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -53,11 +54,12 @@ pub struct Inner {
     refreshers: RefCell<Vec<Refresh>>,
 }
 
-/// What checking for updates found: the system's inputs as `nix flake
-/// update` would lock them, and when it looked.
+/// What checking for updates found: each input as `nix flake update` would
+/// lock it, why any couldn't be checked, and when it looked.
 pub struct UpdateCheck {
     pub when: i64,
     pub inputs: Vec<Input>,
+    pub failures: BTreeMap<String, String>,
 }
 
 /// Yukimi's cache directory, `~/.cache/yukimi`.
@@ -68,27 +70,65 @@ fn cache_dir() -> Option<PathBuf> {
     Some(base.join("yukimi"))
 }
 
-/// Where the last check for updates keeps its lock file.
-fn check_file() -> Option<PathBuf> {
-    Some(cache_dir()?.join("updates").join("flake.lock"))
+/// Where the last check for updates keeps its answers: a lock file for each
+/// input it checked (`<input>.lock`) and why others couldn't be checked.
+fn check_dir() -> Option<PathBuf> {
+    Some(cache_dir()?.join("updates"))
 }
 
-fn load_check(path: &std::path::Path) -> Option<UpdateCheck> {
-    let lock = FlakeLock::parse(&std::fs::read_to_string(path).ok()?).ok()?;
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+const FAILURES: &str = "failures.json";
+
+fn load_check(dir: &Path) -> Option<UpdateCheck> {
+    let failures_file = dir.join(FAILURES);
+    let failures: BTreeMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(&failures_file).ok()?).ok()?;
+    let modified = std::fs::metadata(&failures_file).ok()?.modified().ok()?;
     let when = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
-    Some(UpdateCheck { when, inputs: lock.inputs() })
+    let mut inputs = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".lock")) else {
+            continue;
+        };
+        let lock = std::fs::read_to_string(&path).ok().and_then(|text| FlakeLock::parse(&text).ok());
+        if let Some(input) = lock.and_then(|lock| lock.input(name)) {
+            inputs.push(input);
+        }
+    }
+    Some(UpdateCheck { when, inputs, failures })
 }
 
-/// Ask Nix for the newest version of every input, keeping the answer.
-fn run_check(path: &std::path::Path) -> Result<UpdateCheck, String> {
-    let dir = path.parent().ok_or("No cache directory")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let partial = dir.join("flake.lock.new");
-    let _ = std::fs::remove_file(&partial);
-    yukimi_system::nix::check_updates(yukimi_system::CONFIG_DIR, &partial).map_err(|e| e.to_string())?;
-    std::fs::rename(&partial, path).map_err(|e| e.to_string())?;
-    load_check(path).ok_or_else(|| "The newest versions could not be read".to_owned())
+/// The gist of a Nix error: its first line, without the "error:" label
+/// (`unable to download 'https://…/commits/stable': HTTP error 422`).
+fn first_line(error: &str) -> String {
+    error
+        .lines()
+        .map(|line| line.trim().trim_start_matches("error:").trim())
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown error")
+        .to_owned()
+}
+
+/// Ask Nix for the newest version of each input, keeping the answers.
+fn run_check(dir: &Path, names: &[String]) -> Result<UpdateCheck, String> {
+    let partial = dir.with_extension("new");
+    let _ = std::fs::remove_dir_all(&partial);
+    std::fs::create_dir_all(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
+    let failures: BTreeMap<String, String> =
+        yukimi_system::nix::check_updates(yukimi_system::CONFIG_DIR, names, &partial)
+            .into_iter()
+            .filter_map(|(name, result)| result.err().map(|e| (name, first_line(&e.to_string()))))
+            .collect();
+    // Nothing answered (offline, say): keep the last check.
+    if !names.is_empty() && failures.len() == names.len() {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(failures.into_values().next().unwrap_or_default());
+    }
+    let json = serde_json::to_string_pretty(&failures).map_err(|e| e.to_string())?;
+    std::fs::write(partial.join(FAILURES), json).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::rename(&partial, dir).map_err(|e| e.to_string())?;
+    load_check(dir).ok_or_else(|| "The newest versions could not be read".to_owned())
 }
 
 impl Ctx {
@@ -119,16 +159,23 @@ impl Ctx {
 
     /// Look for newer versions of the system's inputs, in the background.
     pub fn check_updates(&self) {
-        let Some(path) = check_file() else {
+        let Some(dir) = check_dir() else {
             return;
         };
+        let names: Vec<String> = self
+            .model()
+            .inputs
+            .iter()
+            .filter(|input| input.follows.is_none() && input.locked.is_some())
+            .map(|input| input.name.clone())
+            .collect();
         if self.0.checking.replace(true) {
             return;
         }
         self.refresh_all();
         let ctx = self.clone();
         glib::spawn_future_local(async move {
-            let checked = gio::spawn_blocking(move || run_check(&path))
+            let checked = gio::spawn_blocking(move || run_check(&dir, &names))
                 .await
                 .unwrap_or_else(|_| Err("Checking for updates stopped unexpectedly".to_owned()));
             ctx.0.checking.set(false);
@@ -314,7 +361,7 @@ pub fn build_window(app: &adw::Application) {
         model: RefCell::new(Rc::new(Model::default())),
         index: RefCell::new(None),
         indexing: Cell::new(false),
-        updates: RefCell::new(check_file().and_then(|path| load_check(&path)).map(Rc::new)),
+        updates: RefCell::new(check_dir().and_then(|dir| load_check(&dir)).map(Rc::new)),
         checking: Cell::new(false),
         loading: Cell::new(false),
         refreshers: RefCell::new(Vec::new()),

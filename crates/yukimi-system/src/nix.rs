@@ -135,23 +135,45 @@ pub fn stream(mut command: Command, stop: &Stop, mut update: impl FnMut(&Progres
     Ok((out, progress))
 }
 
-/// What updating the system flake would bring, without changing it:
-/// `nix flake update` writes its lock file to `output` instead. It needs no
-/// administrator, and what it downloads is reused by the real update.
-pub fn check_updates(config_dir: &str, output: &std::path::Path) -> Result<()> {
-    let result = command()
-        .args(["flake", "update", "--flake", &format!("path:{config_dir}"), "--output-lock-file"])
-        .arg(output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| Error::Spawn("nix".into(), e))?;
-    if !result.status.success() {
-        let stderr = crate::log::strip_ansi(&String::from_utf8_lossy(&result.stderr));
-        return Err(Error::Failed(last_error(&stderr)));
-    }
-    Ok(())
+/// What updating each of `inputs` would bring, without changing the system
+/// flake: one `nix flake update <input>` per input, side by side, each
+/// writing its lock file into `dir` as `<input>.lock`. A source that can't
+/// be reached (or a branch that doesn't exist yet) fails on its own, and
+/// the rest still answer. Needs no administrator, and what it downloads is
+/// reused by the real update.
+pub fn check_updates(config_dir: &str, inputs: &[String], dir: &std::path::Path) -> Vec<(String, Result<()>)> {
+    std::thread::scope(|scope| {
+        let checks: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                let output = dir.join(format!("{input}.lock"));
+                let flake = format!("path:{config_dir}");
+                scope.spawn(move || -> Result<()> {
+                    let result = command()
+                        .args(["flake", "update", input, "--flake", &flake, "--output-lock-file"])
+                        .arg(&output)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .map_err(|e| Error::Spawn("nix".into(), e))?;
+                    if !result.status.success() {
+                        let stderr = crate::log::strip_ansi(&String::from_utf8_lossy(&result.stderr));
+                        return Err(Error::Failed(last_error(&stderr)));
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        inputs
+            .iter()
+            .cloned()
+            .zip(checks)
+            .map(|(input, check)| {
+                (input, check.join().unwrap_or_else(|_| Err(Error::Failed("the check stopped unexpectedly".into()))))
+            })
+            .collect()
+    })
 }
 
 /// Store paths of the system flake's inputs Yukimi reads from: Nixpkgs and
@@ -198,6 +220,18 @@ mod tests {
         let mut failing = Command::new("sh");
         failing.args(["-c", r#"echo '@nix {"action":"msg","level":0,"msg":"error: nope"}' >&2; exit 1"#]);
         assert_eq!(stream(failing, &Stop::default(), |_| {}).unwrap_err().to_string(), "error: nope");
+    }
+
+    #[test]
+    fn each_input_checked_on_its_own() {
+        // Without Nix's flake, every input fails, separately and by name.
+        let dir = std::env::temp_dir().join(format!("yukimi-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inputs = vec!["nixpkgs".to_owned(), "tatami".to_owned()];
+        let results = check_updates(&dir.join("missing").to_string_lossy(), &inputs, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(results.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["nixpkgs", "tatami"]);
+        assert!(results.iter().all(|(_, result)| result.is_err()));
     }
 
     #[test]

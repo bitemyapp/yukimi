@@ -83,9 +83,16 @@ fn actions(ctx: &Ctx, movements: Option<&BTreeMap<String, Movement>>) -> gtk::Bo
 }
 
 /// The time, badge and tooltip for one input, given how updating would
-/// move it.
-fn status(row: &adw::ActionRow, source: &str, age: Option<String>, movement: Option<&Movement>) {
+/// move it, or why it couldn't be checked.
+fn status(row: &adw::ActionRow, source: &str, age: Option<String>, movement: Option<&Movement>, failure: Option<&str>) {
     let age = age.unwrap_or_default();
+    if let Some(reason) = failure {
+        row.add_suffix(&dim(&age));
+        let mark = badge("couldn't check", "unchecked");
+        mark.set_tooltip_text(Some(&format!("{source} couldn't be asked for its newest version: {reason}")));
+        row.add_suffix(&mark);
+        return;
+    }
     match movement {
         Some(Movement::Newer(next)) => {
             let text = match next.last_modified {
@@ -128,7 +135,9 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
     ctx.on_refresh(move |ctx| {
         clear(&content);
         let model = ctx.model();
-        let movements = ctx.update_check().map(|check| compare(&model.inputs, &check.inputs));
+        let check = ctx.update_check();
+        let movements = check.as_ref().map(|check| compare(&model.inputs, &check.inputs));
+        let failures = check.map(|check| check.failures.clone()).unwrap_or_default();
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 18);
         let intro = heading(
             "Where your system comes from",
@@ -158,7 +167,7 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
                 ));
                 banner.set_revealed(true);
                 content.append(&banner);
-            } else if movements.values().all(|m| *m == Movement::Current) {
+            } else if failures.is_empty() && movements.values().all(|m| *m == Movement::Current) {
                 let done = adw::StatusPage::builder()
                     .icon_name("emblem-ok-symbolic")
                     .title("Everything is up to date")
@@ -195,7 +204,13 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
                     }
                     row.set_subtitle(&subtitle);
                     let movement = movements.as_ref().and_then(|m| m.get(&input.name));
-                    status(&row, &source, locked.last_modified.map(|t| human_age(t, now())), movement);
+                    status(
+                        &row,
+                        &source,
+                        locked.last_modified.map(|t| human_age(t, now())),
+                        movement,
+                        failures.get(&input.name).map(String::as_str),
+                    );
                     if let Some(url) = locked.web_url() {
                         let open = gtk::Button::from_icon_name("adw-external-link-symbolic");
                         open.add_css_class("flat");
