@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Find one setting in a NixOS module and change only it.
 //!
-//! A setting can be written as a path (`calamares.applications = [ … ];`) or
-//! nested (`calamares = { applications = [ … ]; };`); both are found. A
+//! A setting can be written as a path (`environment.systemPackages = [ … ];`)
+//! or nested (`environment = { systemPackages = [ … ]; };`); both are found. A
 //! module can be a set of settings or a function returning one, possibly
 //! through `let … in` or `with …;`. Changes are made by replacing the text of
 //! one expression, so everything else in the file is untouched, and the
@@ -141,6 +141,20 @@ pub fn string_value(text: &str, path: &[&str]) -> Result<Option<String>> {
     })
 }
 
+/// Replace a setting that is a plain string, such as a flake input's `url`.
+pub fn set_string_value(text: &str, path: &[&str], value: &str) -> Result<String> {
+    let root = parse(text)?;
+    let Some(ast::Expr::Str(string)) = find(&root, path)? else {
+        return Err(Error::NotAString(dotted(path)));
+    };
+    if plain_string(&string).is_none() {
+        return Err(Error::NotAString(dotted(path)));
+    }
+    let new = replace(text, string.syntax().text_range(), &nix_string(value));
+    parse(&new)?;
+    Ok(new)
+}
+
 /// A setting that is `true` or `false`, such as `nixpkgs.config.allowUnfree`.
 pub fn bool_value(text: &str, path: &[&str]) -> Result<Option<bool>> {
     let root = parse(text)?;
@@ -268,6 +282,134 @@ pub fn add_import(text: &str, import: &str) -> Result<String> {
     Ok(new)
 }
 
+/// The strings in a list bound in the `let` in front of a module's settings
+/// (`let packages = [ … ]; in { … }`), or `None` when there is no such list.
+pub fn let_string_list(text: &str, name: &str) -> Result<Option<Vec<String>>> {
+    let root = parse(text)?;
+    let Some(ast::Expr::List(list)) = module_lets(&root).iter().find_map(|let_in| find_in(let_in, &[name])) else {
+        return Ok(None);
+    };
+    list.items()
+        .map(|item| match item {
+            ast::Expr::Str(string) => plain_string(&string).ok_or_else(|| Error::NotAStringList(name.to_owned())),
+            _ => Err(Error::NotAStringList(name.to_owned())),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// One entry of a package list such as `environment.systemPackages`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedPackage {
+    /// Its attribute in Nixpkgs, when the entry plainly names one
+    /// (`firefox` under `with pkgs;`, `pkgs.kdePackages.kate`): then Yukimi
+    /// can tell what it is, and take it out.
+    pub attr: Option<String>,
+    /// The entry as written.
+    pub text: String,
+}
+
+/// The lists a package-list setting is made of: `[ … ]`, `with pkgs; [ … ]`,
+/// either in parentheses, and several joined with `++`. Anything else
+/// (`lib.optionals …`) is left alone.
+fn lists_in(expr: ast::Expr, out: &mut Vec<ast::List>) {
+    match expr {
+        ast::Expr::List(list) => out.push(list),
+        ast::Expr::With(with) => {
+            if let Some(body) = with.body() {
+                lists_in(body, out);
+            }
+        }
+        ast::Expr::Paren(paren) => {
+            if let Some(inner) = paren.expr() {
+                lists_in(inner, out);
+            }
+        }
+        ast::Expr::BinOp(op) if op.operator() == Some(ast::BinOpKind::Concat) => {
+            for side in [op.lhs(), op.rhs()].into_iter().flatten() {
+                lists_in(side, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The attribute an entry names: an identifier (under `with pkgs;`), or a
+/// chain of them (`pkgs.kdePackages.kate`, `kdePackages.kate`), without
+/// the leading `pkgs`.
+fn entry_attr(item: &ast::Expr) -> Option<String> {
+    let names = match item {
+        ast::Expr::Ident(ident) => vec![ident.ident_token()?.text().to_owned()],
+        ast::Expr::Select(select) if select.default_expr().is_none() => {
+            let ast::Expr::Ident(base) = select.expr()? else {
+                return None;
+            };
+            let mut names = vec![base.ident_token()?.text().to_owned()];
+            for attr in select.attrpath()?.attrs() {
+                names.push(attr_name(&attr)?);
+            }
+            names
+        }
+        _ => return None,
+    };
+    let names = match names.split_first() {
+        Some((first, rest)) if first == "pkgs" => rest.to_vec(),
+        _ => names,
+    };
+    (!names.is_empty() && !matches!(names[0].as_str(), "true" | "false" | "null")).then(|| names.join("."))
+}
+
+/// The entries of a package-list setting, or `None` when it is absent.
+pub fn package_list(text: &str, path: &[&str]) -> Result<Option<Vec<ListedPackage>>> {
+    let root = parse(text)?;
+    let Some(value) = find(&root, path)? else {
+        return Ok(None);
+    };
+    let mut lists = Vec::new();
+    lists_in(value, &mut lists);
+    Ok(Some(
+        lists
+            .iter()
+            .flat_map(|list| list.items())
+            .map(|item| ListedPackage { attr: entry_attr(&item), text: item.syntax().text().to_string() })
+            .collect(),
+    ))
+}
+
+/// Take the entry naming `attr` out of a package-list setting, with its
+/// line when it has one to itself (and the comment after it). `None` when
+/// the list has no such entry.
+pub fn remove_package(text: &str, path: &[&str], attr: &str) -> Result<Option<String>> {
+    let root = parse(text)?;
+    let Some(value) = find(&root, path)? else {
+        return Ok(None);
+    };
+    let mut lists = Vec::new();
+    lists_in(value, &mut lists);
+    let Some(item) = lists.iter().flat_map(|list| list.items()).find(|item| entry_attr(item).as_deref() == Some(attr))
+    else {
+        return Ok(None);
+    };
+    let range = item.syntax().text_range();
+    let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[end..].find('\n').map_or(text.len(), |i| end + i);
+    let after = text[end..line_end].trim();
+    let new = if text[line_start..start].trim().is_empty() && (after.is_empty() || after.starts_with('#')) {
+        // The entry's own line goes, newline and all.
+        let through = (line_end + 1).min(text.len());
+        format!("{}{}", &text[..line_start], &text[through..])
+    } else if text[end..].starts_with(' ') {
+        format!("{}{}", &text[..start], &text[end + 1..])
+    } else if text[..start].ends_with(' ') {
+        format!("{}{}", &text[..start - 1], &text[end..])
+    } else {
+        format!("{}{}", &text[..start], &text[end..])
+    };
+    parse(&new)?;
+    Ok(Some(new))
+}
+
 /// Whether a file's syntax tree has a node of this kind; for tests.
 #[cfg(test)]
 fn has(node: &rnix::SyntaxNode, kind: SyntaxKind) -> bool {
@@ -354,6 +496,75 @@ mod tests {
         assert!(string_list(interpolated, &["calamares", "applications"]).is_err());
         assert!(matches!(set_string_list("{ broken", &["a"], &[]), Err(Error::Syntax(_))));
         assert_eq!(string_list("42", &["a"]), Err(Error::NotAModule));
+    }
+
+    /// What NixOS's own installer writes, more or less.
+    const HANDWRITTEN: &str = r#"{ config, pkgs, ... }:
+{
+  imports = [ ./hardware-configuration.nix ];
+  users.users.alice = {
+    isNormalUser = true;
+    packages = with pkgs; [
+      kdePackages.kate
+      thunderbird # mail
+    #  tree
+    ];
+  };
+  environment.systemPackages = with pkgs; [ vim wget (python3.withPackages (p: [ p.rich ])) ] ++ [ pkgs.git ];
+  system.stateVersion = "26.05";
+}
+"#;
+
+    #[test]
+    fn package_lists_as_written() {
+        let user = package_list(HANDWRITTEN, &["users", "users", "alice", "packages"]).unwrap().unwrap();
+        assert_eq!(
+            user.iter().map(|p| p.attr.as_deref()).collect::<Vec<_>>(),
+            [Some("kdePackages.kate"), Some("thunderbird")]
+        );
+        let system = package_list(HANDWRITTEN, &["environment", "systemPackages"]).unwrap().unwrap();
+        assert_eq!(
+            system.iter().map(|p| p.attr.as_deref()).collect::<Vec<_>>(),
+            [Some("vim"), Some("wget"), None, Some("git")]
+        );
+        assert_eq!(system[2].text, "(python3.withPackages (p: [ p.rich ]))");
+        assert_eq!(package_list(HANDWRITTEN, &["users", "users", "bob", "packages"]).unwrap(), None);
+    }
+
+    #[test]
+    fn packages_come_out_of_lists() {
+        let path = ["users", "users", "alice", "packages"];
+        let new = remove_package(HANDWRITTEN, &path, "thunderbird").unwrap().unwrap();
+        assert!(new.contains("      kdePackages.kate\n    #  tree\n    ];"), "{new}");
+        let path = ["environment", "systemPackages"];
+        let new = remove_package(HANDWRITTEN, &path, "wget").unwrap().unwrap();
+        assert!(new.contains("with pkgs; [ vim (python3"), "{new}");
+        let new = remove_package(&new, &path, "git").unwrap().unwrap();
+        assert!(new.contains("] ++ [ ];"), "{new}");
+        assert_eq!(remove_package(HANDWRITTEN, &path, "emacs").unwrap(), None);
+        // Only the setting asked about changes.
+        assert_eq!(remove_package(HANDWRITTEN, &["users", "users", "alice", "packages"], "vim").unwrap(), None);
+    }
+
+    #[test]
+    fn flake_input_addresses() {
+        let flake = "{\n  # Where Tatami comes from.\n  inputs.tatami.url = \"github:bitemyapp/tatami/stable\";\n  \
+                     inputs.tatami.inputs.nixpkgs.follows = \"nixpkgs\";\n  inputs = { yukimi = { url = \"github:bitemyapp/yukimi\"; }; };\n  \
+                     outputs = { ... }: { };\n}\n";
+        let path = ["inputs", "tatami", "url"];
+        assert_eq!(string_value(flake, &path).unwrap().as_deref(), Some("github:bitemyapp/tatami/stable"));
+        let new = set_string_value(flake, &path, "github:bitemyapp/tatami/main").unwrap();
+        assert_eq!(new, flake.replace("tatami/stable", "tatami/main"));
+        let nested = set_string_value(flake, &["inputs", "yukimi", "url"], "github:bitemyapp/yukimi/main").unwrap();
+        assert!(nested.contains("yukimi = { url = \"github:bitemyapp/yukimi/main\"; };"), "{nested}");
+        assert!(set_string_value(flake, &["inputs", "nixpkgs", "url"], "x").is_err());
+    }
+
+    #[test]
+    fn lists_in_lets() {
+        let text = "{ lib, ... }:\nlet\n  packages = [ \"htop\" ];\nin\n{ programs = lib.genAttrs [ ] (_: { }); }\n";
+        assert_eq!(let_string_list(text, "packages").unwrap(), Some(vec!["htop".to_owned()]));
+        assert_eq!(let_string_list(text, "programs").unwrap(), None);
     }
 
     #[test]

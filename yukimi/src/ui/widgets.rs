@@ -34,7 +34,9 @@ impl Seed {
 }
 
 /// Gently falling snow, drawn over whatever is behind it. Stands still when
-/// the desktop asks for less animation.
+/// the desktop asks for less animation, and while the window is in the
+/// background; otherwise moves thirty times a second, which is plenty for
+/// snow and half the work of every frame.
 pub fn snowfall(count: usize) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_can_target(false);
@@ -90,11 +92,16 @@ pub fn snowfall(count: usize) -> gtk::DrawingArea {
     let start = Rc::new(RefCell::new(None::<i64>));
     area.add_tick_callback(move |widget, clock| {
         let animate = gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations());
-        if !animate {
-            return glib::ControlFlow::Continue;
-        }
+        let active = widget.root().and_downcast::<gtk::Window>().is_none_or(|w| w.is_active());
         let now = clock.frame_time();
         let mut last = start.borrow_mut();
+        if !animate || !active {
+            *last = None;
+            return glib::ControlFlow::Continue;
+        }
+        if last.is_some_and(|t| now - t < 33_000) {
+            return glib::ControlFlow::Continue;
+        }
         let dt = last.map_or(0.0, |t| ((now - t) as f64 / 1e6).min(0.1));
         *last = Some(now);
         let (flakes, time) = &mut *state.borrow_mut();
@@ -189,6 +196,47 @@ pub fn heading(title: &str, explanation: &str) -> gtk::Box {
 pub fn page(content: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
     let clamp = adw::Clamp::builder().maximum_size(960).tightening_threshold(720).child(content).build();
     gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&clamp).build()
+}
+
+/// Add many rows a batch at a time, between frames, so a long list never
+/// holds up the window: `add` puts each made row in place. Stops when
+/// `anchor` is no longer in a window (its page was built again).
+pub fn fill_later<T: 'static, W: IsA<gtk::Widget>>(
+    anchor: &impl IsA<gtk::Widget>,
+    items: Vec<T>,
+    make: impl Fn(&T) -> W + 'static,
+    add: impl Fn(&W) + 'static,
+) {
+    const BATCH: usize = 40;
+    let _busy = crate::stalls::doing("adding rows");
+    let mut items = items.into_iter();
+    // The first batch at once, so the list doesn't start empty.
+    for item in items.by_ref().take(BATCH) {
+        add(&make(&item));
+    }
+    let anchor = anchor.as_ref().downgrade();
+    glib::idle_add_local(move || {
+        if anchor.upgrade().is_none_or(|a| a.root().is_none()) {
+            return glib::ControlFlow::Break;
+        }
+        let _busy = crate::stalls::doing("adding rows");
+        let mut added = 0;
+        for item in items.by_ref().take(BATCH) {
+            add(&make(&item));
+            added += 1;
+        }
+        if added < BATCH { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
+    });
+}
+
+/// A row saying something is still being read.
+pub fn pending_row(text: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::new();
+    row.set_title(text);
+    let spinner = adw::Spinner::new();
+    row.add_prefix(&spinner);
+    row.add_css_class("dim-row");
+    row
 }
 
 /// Remove every child of a box.

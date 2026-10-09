@@ -7,9 +7,18 @@ use adw::prelude::*;
 
 mod model;
 mod ops;
+mod stalls;
 mod ui;
 
 const APP_ID: &str = "io.github.bitemyapp.Yukimi";
+
+/// Yukimi's cache directory, `~/.cache/yukimi`.
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("yukimi"))
+}
 
 fn main() -> gtk::glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -25,6 +34,7 @@ fn main() -> gtk::glib::ExitCode {
             window.present();
             return;
         }
+        stalls::watch();
         ui::build_window(app);
     });
     app.run()

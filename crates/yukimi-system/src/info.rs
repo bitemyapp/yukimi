@@ -2,8 +2,6 @@
 //! This computer at a glance.
 use std::path::Path;
 
-use crate::CONFIG_DIR;
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SystemInfo {
     pub hostname: String,
@@ -11,8 +9,6 @@ pub struct SystemInfo {
     pub nixos_version: String,
     /// The running kernel, such as `7.2.8`.
     pub kernel: String,
-    /// The system is configured by a flake in `/etc/nixos`.
-    pub flake: bool,
     /// The system running now differs from the one the machine started
     /// with in its kernel, initrd or kernel modules, so a restart would
     /// finish an update.
@@ -27,7 +23,6 @@ impl SystemInfo {
                 .map(|v| v.trim().to_owned())
                 .unwrap_or_default(),
             kernel: kernel_release(),
-            flake: Path::new(CONFIG_DIR).join("flake.nix").exists(),
             restart_needed: restart_needed(Path::new("/run/booted-system"), Path::new("/run/current-system")),
         }
     }
@@ -51,7 +46,8 @@ pub fn restart_needed(booted: &Path, current: &Path) -> bool {
     })
 }
 
-fn hostname() -> String {
+/// This computer's name, as the kernel has it.
+pub fn hostname() -> String {
     let mut buffer = [0u8; 256];
     // SAFETY: gethostname writes at most buffer.len() bytes into buffer.
     let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;

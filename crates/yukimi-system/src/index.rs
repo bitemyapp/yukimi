@@ -7,6 +7,10 @@
 //! available on this machine, and the program it provides. That takes a
 //! minute; the result is cached, and searching it ([`PackageIndex::search`])
 //! is instant.
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -80,6 +84,76 @@ pub fn expression(nixpkgs: &str) -> String {
 in
 builtins.concatLists (lib.mapAttrsToList describe pkgs)"#
     )
+}
+
+/// Where the index of the Nixpkgs at `nixpkgs` is kept in `cache`.
+fn cache_file(cache: &Path, nixpkgs: &str) -> Option<PathBuf> {
+    let name = Path::new(nixpkgs).file_name()?.to_string_lossy().into_owned();
+    Some(cache.join(format!("packages-{name}.json")))
+}
+
+/// The cached indexes, newest first.
+fn cached(cache: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(cache)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("packages-") && name.ends_with(".json")
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
+/// The cached index of this Nixpkgs (`true`), or else of the one indexed
+/// most recently (`false`), to search while this one's is made.
+pub fn load_cached(cache: &Path, nixpkgs: &str) -> Option<(PackageIndex, bool)> {
+    let wanted = cache_file(cache, nixpkgs)?;
+    if let Some(index) = std::fs::read_to_string(&wanted).ok().and_then(|t| PackageIndex::parse(&t).ok()) {
+        return Some((index, true));
+    }
+    cached(cache).into_iter().find_map(|file| {
+        let index = PackageIndex::parse(&std::fs::read_to_string(file).ok()?).ok()?;
+        Some((index, false))
+    })
+}
+
+/// Make the index of the Nixpkgs at `nixpkgs` and keep it in `cache`, with
+/// the one before it (older ones go). Nix runs at the lowest priority, as
+/// it is busy for a minute or so.
+pub fn make(cache: &Path, nixpkgs: &str) -> Result<PackageIndex, String> {
+    let file = cache_file(cache, nixpkgs).ok_or("Nixpkgs isn't a store path")?;
+    let mut command = crate::nix::command();
+    command
+        .args(["eval", "--json", "--impure", "--expr", &expression(nixpkgs)])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: setpriority is async-signal-safe and touches only this process.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+            Ok(())
+        });
+    }
+    let output = command.output().map_err(|e| format!("Nix could not be started: {e}"))?;
+    if !output.status.success() {
+        let stderr = crate::log::strip_ansi(&String::from_utf8_lossy(&output.stderr));
+        return Err(crate::nix::last_error(&stderr));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let index = PackageIndex::parse(&text).map_err(|e| format!("The package list could not be read: {e}"))?;
+    let _ = std::fs::create_dir_all(cache);
+    let partial = file.with_extension("new");
+    if std::fs::write(&partial, text.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&partial, &file);
+    }
+    for old in cached(cache).into_iter().skip(2) {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(index)
 }
 
 /// A loaded index.

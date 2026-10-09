@@ -96,6 +96,10 @@ pub struct Progress {
     pub bytes: (u64, u64),
     pub messages: Vec<Message>,
     pub log: VecDeque<String>,
+    /// How many lines have been logged in all, of which `log` keeps the
+    /// last few: what a reader that saw `n` of them has yet to see is the
+    /// last `logged - n`.
+    pub logged: u64,
     activities: HashMap<u64, Activity>,
     expected_bytes: HashMap<u64, u64>,
     /// Activities started, most recent last, to say what is happening now.
@@ -223,10 +227,18 @@ impl Progress {
     }
 
     fn push_log(&mut self, line: String) {
+        self.logged += 1;
         if self.log.len() == LOG_LINES {
             self.log.pop_front();
         }
         self.log.push_back(line);
+    }
+
+    /// The lines logged since a reader saw `seen` of them, as many as are
+    /// still kept.
+    pub fn since(&self, seen: u64) -> impl Iterator<Item = &str> {
+        let new = (self.logged.saturating_sub(seen) as usize).min(self.log.len());
+        self.log.iter().skip(self.log.len() - new).map(String::as_str)
     }
 
     /// Errors Nix reported.

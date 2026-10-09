@@ -3,14 +3,19 @@
 //!
 //! Changes for the current user run Nix directly (`nix profile`). Changes
 //! for everyone go through `yukimi-helper`, started with `pkexec` so polkit
-//! asks for an administrator password; it edits `/etc/nixos`, builds the new
-//! system and switches to it, and puts the configuration back if the build
-//! fails. Both report Nix's progress on their error output.
-use std::path::PathBuf;
+//! asks for an administrator password; it edits the configuration, builds
+//! the new system and switches to it, and puts the configuration back if
+//! the build fails. Updating a flake first gets the update ready as the
+//! current user (the new lock file, and every new source in the store), so
+//! that the helper's build downloads nothing again. Every step reports
+//! Nix's progress on its error output.
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use yukimi_config::lock::Input;
 use yukimi_system::nix;
+use yukimi_system::updates;
+
+use crate::model::Model;
 
 /// When a new system takes over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,19 +35,54 @@ impl Mode {
     }
 }
 
+/// A change to what the system installs: each part is left as it is when
+/// `None` (or empty).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemChange {
+    /// What `yukimi.nix` installs, in full.
+    pub packages: Option<Vec<String>>,
+    pub programs: Option<Vec<String>>,
+    /// A system catalog's setting, and the application ids it lists, in full.
+    pub applications: Option<(String, Vec<String>)>,
+    /// Entries to take out of `environment.systemPackages`.
+    pub unlist_system: Vec<String>,
+    /// Entries to take out of a user's `packages`.
+    pub unlist_user: Option<(String, Vec<String>)>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Operation {
     /// Install a Nixpkgs package into the current user's profile.
     InstallForMe { attr: String, unfree: bool },
     /// Remove a package from the current user's profile.
     RemoveForMe { name: String },
-    /// Change what the system installs, update its sources, or both, then
-    /// build and apply it.
-    ChangeSystem { packages: Option<Vec<String>>, applications: Option<Vec<String>>, update: Vec<String>, mode: Mode },
+    /// Install or remove for everyone; `what` names it for the dialog.
+    ChangeSystem { change: SystemChange, what: String, adding: bool },
+    /// Update some of a flake's inputs.
+    UpdateFlake { inputs: Vec<String>, mode: Mode },
+    /// Update root's channels.
+    UpdateChannels { mode: Mode },
+    /// Make a flake input follow another branch of its repository, and
+    /// update it to that branch's newest commit.
+    FollowBranch { input: String, branch: String },
     /// Return the system to an earlier generation.
     Rollback { generation: u32 },
     /// Delete old system generations and collect garbage.
     Clean { older_than_days: Option<u32> },
+}
+
+/// A command a job runs, and whether it runs as root (through pkexec).
+pub struct Run {
+    pub command: Command,
+    pub as_root: bool,
+}
+
+/// One step of a job, done in the job's own thread, in order: it can
+/// prepare files, and gives the command to run next, if any.
+pub type Step = Box<dyn FnOnce() -> Result<Option<Run>, String> + Send>;
+
+fn step(run: Run) -> Step {
+    Box::new(move || Ok(Some(run)))
 }
 
 impl Operation {
@@ -51,13 +91,10 @@ impl Operation {
         match self {
             Operation::InstallForMe { attr, .. } => format!("Installing {attr} for you"),
             Operation::RemoveForMe { name } => format!("Removing {name}"),
-            Operation::ChangeSystem { update, packages, applications, .. } => {
-                if !update.is_empty() && packages.is_none() && applications.is_none() {
-                    "Updating your system".to_owned()
-                } else {
-                    "Changing what your system installs".to_owned()
-                }
-            }
+            Operation::ChangeSystem { what, adding: true, .. } => format!("Installing {what} for everyone"),
+            Operation::ChangeSystem { what, adding: false, .. } => format!("Removing {what}"),
+            Operation::UpdateFlake { .. } | Operation::UpdateChannels { .. } => "Updating your system".to_owned(),
+            Operation::FollowBranch { input, branch } => format!("Following {branch} for {input}"),
             Operation::Rollback { generation } => format!("Returning to generation {generation}"),
             Operation::Clean { .. } => "Cleaning up the store".to_owned(),
         }
@@ -68,8 +105,13 @@ impl Operation {
         match self {
             Operation::InstallForMe { attr, .. } => format!("{attr} is installed for you"),
             Operation::RemoveForMe { name } => format!("{name} is removed"),
-            Operation::ChangeSystem { mode: Mode::Boot, .. } => "Ready: it takes over at the next restart".to_owned(),
-            Operation::ChangeSystem { .. } => "Your system is up to date with your choices".to_owned(),
+            Operation::ChangeSystem { what, adding: true, .. } => format!("{what} is installed for everyone"),
+            Operation::ChangeSystem { what, adding: false, .. } => format!("{what} is removed"),
+            Operation::UpdateFlake { mode: Mode::Boot, .. } | Operation::UpdateChannels { mode: Mode::Boot } => {
+                "Ready: it takes over at the next restart".to_owned()
+            }
+            Operation::UpdateFlake { .. } | Operation::UpdateChannels { .. } => "Your system is up to date".to_owned(),
+            Operation::FollowBranch { input, branch } => format!("{input} follows {branch} now"),
             Operation::Rollback { generation } => format!("Generation {generation} is running"),
             Operation::Clean { .. } => "The store is tidy".to_owned(),
         }
@@ -83,6 +125,9 @@ impl Operation {
                 "Generation {generation} is running. Its configuration wasn't kept, so your next change builds on \
                  the newer one"
             ),
+            Operation::Rollback { generation } if report["left"].as_array().is_some_and(|l| !l.is_empty()) => {
+                format!("Generation {generation} is running. Files you changed by hand since were left as they are")
+            }
             Operation::Clean { .. } => match report["freed"].as_str() {
                 Some(freed) if !freed.is_empty() => format!("The store is tidy: {freed}"),
                 _ => self.done(),
@@ -96,8 +141,8 @@ impl Operation {
         !matches!(self, Operation::InstallForMe { .. } | Operation::RemoveForMe { .. })
     }
 
-    /// The command that does it.
-    pub fn command(&self, nixpkgs: &str) -> Command {
+    /// The steps that do it.
+    pub fn steps(&self, model: &Model) -> Vec<Step> {
         match self {
             Operation::InstallForMe { attr, unfree } => {
                 let mut c = nix::command();
@@ -105,33 +150,50 @@ impl Operation {
                 if *unfree {
                     c.env("NIXPKGS_ALLOW_UNFREE", "1").arg("--impure");
                 }
-                c.arg(format!("{nixpkgs}#{attr}"));
-                c
+                c.arg(format!("{}#{attr}", model.nixpkgs_ref()));
+                vec![step(Run { command: c, as_root: false })]
             }
             Operation::RemoveForMe { name } => {
                 let mut c = nix::command();
                 c.args(["profile", "remove", "--log-format", "internal-json", "-v", name]);
-                c
+                vec![step(Run { command: c, as_root: false })]
             }
-            Operation::ChangeSystem { packages, applications, update, mode } => {
+            Operation::ChangeSystem { change, .. } => {
                 let mut c = helper();
                 c.arg("change");
-                if let Some(packages) = packages {
+                if let Some(packages) = &change.packages {
                     c.arg("--packages").arg(packages.join(","));
                 }
-                if let Some(applications) = applications {
-                    c.arg("--applications").arg(applications.join(","));
+                if let Some(programs) = &change.programs {
+                    c.arg("--programs").arg(programs.join(","));
                 }
-                if !update.is_empty() {
-                    c.arg("--update").arg(update.join(","));
+                if let Some((setting, ids)) = &change.applications {
+                    c.arg("--setting").arg(setting).arg("--applications").arg(ids.join(","));
                 }
-                c.arg("--mode").arg(mode.arg());
-                c
+                if !change.unlist_system.is_empty() {
+                    c.arg("--unlist-system").arg(change.unlist_system.join(","));
+                }
+                if let Some((user, attrs)) = &change.unlist_user {
+                    c.arg("--unlist-user").arg(format!("{user}:{}", attrs.join(",")));
+                }
+                c.args(["--mode", "switch"]);
+                vec![step(Run { command: c, as_root: true })]
+            }
+            Operation::UpdateFlake { inputs, mode } => update_steps(model, inputs, *mode),
+            Operation::UpdateChannels { mode } => {
+                let mut c = helper();
+                c.args(["change", "--channels", "--mode", mode.arg()]);
+                vec![step(Run { command: c, as_root: true })]
+            }
+            Operation::FollowBranch { input, branch } => {
+                let mut c = helper();
+                c.args(["change", "--follow", &format!("{input}={branch}"), "--mode", "switch"]);
+                vec![step(Run { command: c, as_root: true })]
             }
             Operation::Rollback { generation } => {
                 let mut c = helper();
                 c.args(["rollback", &generation.to_string()]);
-                c
+                vec![step(Run { command: c, as_root: true })]
             }
             Operation::Clean { older_than_days } => {
                 let mut c = helper();
@@ -139,15 +201,56 @@ impl Operation {
                 if let Some(days) = older_than_days {
                     c.arg("--older-than-days").arg(days.to_string());
                 }
-                c
+                vec![step(Run { command: c, as_root: true })]
             }
         }
     }
 }
 
-/// `pkexec yukimi-helper`, the helper installed next to Yukimi.
+/// Updating a flake: the new lock file and its new sources, got ready as
+/// this user, then the helper. Without a cache directory to get it ready
+/// in, the helper fetches everything itself.
+fn update_steps(model: &Model, inputs: &[String], mode: Mode) -> Vec<Step> {
+    let flake = model.setup.flake();
+    let current = model.setup.dir.join("flake.lock");
+    let mut helper_command = helper();
+    helper_command.args(["change", "--update", &inputs.join(","), "--mode", mode.arg()]);
+    let Some(dir) = crate::cache_dir() else {
+        return vec![step(Run { command: helper_command, as_root: true })];
+    };
+    let (lock, sources) = (dir.join("update.lock"), dir.join("update-sources.json"));
+    let lock_step: Step = {
+        let (dir, lock, inputs) = (dir.clone(), lock.clone(), inputs.to_vec());
+        Box::new(move || {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let _ = std::fs::remove_file(&lock);
+            Ok(Some(Run { command: updates::lock_command(&flake, &inputs, &lock), as_root: false }))
+        })
+    };
+    let fetch_step: Step = {
+        let (lock, sources) = (lock.clone(), sources.clone());
+        Box::new(move || {
+            let current = std::fs::read_to_string(&current).map_err(|e| format!("{}: {e}", current.display()))?;
+            let proposed = std::fs::read_to_string(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+            let fresh = updates::new_sources(&current, &proposed);
+            if fresh.is_empty() {
+                return Ok(None);
+            }
+            let json = serde_json::to_string(&fresh).map_err(|e| e.to_string())?;
+            std::fs::write(&sources, json).map_err(|e| format!("{}: {e}", sources.display()))?;
+            Ok(Some(Run { command: updates::fetch_command(&sources), as_root: false }))
+        })
+    };
+    helper_command.arg("--lock").arg(&lock);
+    vec![lock_step, fetch_step, step(Run { command: helper_command, as_root: true })]
+}
+
+/// `pkexec yukimi-helper`, the helper installed next to Yukimi. On NixOS
+/// only the wrapper in /run/wrappers is setuid; the polkit package's own
+/// pkexec, which can come first in the search path, refuses to run.
 fn helper() -> Command {
-    let mut c = Command::new("pkexec");
+    let wrapper = Path::new("/run/wrappers/bin/pkexec");
+    let mut c = Command::new(if wrapper.exists() { wrapper } else { Path::new("pkexec") });
     c.arg(helper_path());
     c
 }
@@ -160,26 +263,13 @@ pub fn helper_path() -> PathBuf {
     dir.join("yukimi-helper")
 }
 
-/// The flake reference of the system's Nixpkgs, as `flake.lock` pins it, so
-/// packages installed for one user match the system's versions.
-pub fn nixpkgs_ref(inputs: &[Input]) -> String {
-    let locked = inputs.iter().find(|i| i.name == "nixpkgs").and_then(|i| i.locked.as_ref());
-    match locked {
-        Some(l) if l.kind == "github" => match (&l.owner, &l.repo, &l.rev) {
-            (Some(owner), Some(repo), Some(rev)) => format!("github:{owner}/{repo}/{rev}"),
-            _ => "nixpkgs".to_owned(),
-        },
-        Some(l) => l.url.clone().unwrap_or_else(|| "nixpkgs".to_owned()),
-        None => "nixpkgs".to_owned(),
-    }
-}
-
 /// Open a terminal running `command`, with whichever terminal is installed.
 pub fn open_terminal(command: &[String]) -> Result<(), String> {
     // (program, arguments before the command)
-    let terminals: [(&str, &[&str]); 9] = [
+    let terminals: [(&str, &[&str]); 11] = [
         ("xdg-terminal-exec", &[]),
         ("kgx", &["--"]),
+        ("ptyxis", &["--"]),
         ("gnome-terminal", &["--"]),
         ("konsole", &["-e"]),
         ("xfce4-terminal", &["-x"]),
@@ -187,6 +277,7 @@ pub fn open_terminal(command: &[String]) -> Result<(), String> {
         ("ghostty", &["-e"]),
         ("kitty", &[]),
         ("alacritty", &["-e"]),
+        ("xterm", &["-e"]),
     ];
     for (program, prefix) in terminals {
         if find_program(program) {
@@ -198,7 +289,7 @@ pub fn open_terminal(command: &[String]) -> Result<(), String> {
 
 fn find_program(name: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+        .map(|path| std::env::split_paths(&path).any(|dir| Path::new(&dir).join(name).is_file()))
         .unwrap_or(false)
 }
 
@@ -225,51 +316,50 @@ pub fn try_command(nixpkgs: &str, attr: &str, program: &str, unfree: bool) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yukimi_config::lock::Locked;
 
-    #[test]
-    fn commands_for_each_operation() {
-        let install =
-            Operation::InstallForMe { attr: "htop".into(), unfree: false }.command("github:NixOS/nixpkgs/abc");
-        let args: Vec<_> = install.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(args.ends_with(&["github:NixOS/nixpkgs/abc#htop".to_owned()]));
-        let change = Operation::ChangeSystem {
-            packages: Some(vec!["htop".into(), "ripgrep".into()]),
-            applications: None,
-            update: vec![],
-            mode: Mode::Switch,
-        }
-        .command("x");
-        let args: Vec<_> = change.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(&args[1..], ["change", "--packages", "htop,ripgrep", "--mode", "switch"]);
-        assert!(Operation::Rollback { generation: 3 }.is_system());
+    fn args(run: Run) -> Vec<String> {
+        run.command.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
     #[test]
-    fn nixpkgs_from_the_lock() {
-        let input = |locked: Locked| Input {
-            name: "nixpkgs".into(),
-            locked: Some(locked),
-            original: None,
-            follows: None,
-            follows_inputs: vec![],
+    fn commands_for_each_operation() {
+        let model =
+            Model { nixpkgs: Some("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-source".into()), ..Model::default() };
+        let install = Operation::InstallForMe { attr: "htop".into(), unfree: false };
+        let run = install.steps(&model).remove(0)().unwrap().unwrap();
+        assert!(!run.as_root);
+        assert!(args(run).ends_with(&["path:/nix/store/0123456789abcdfghijklmnpqrsvwxyz-source#htop".to_owned()]));
+        let change = Operation::ChangeSystem {
+            change: SystemChange {
+                packages: Some(vec!["htop".into(), "ripgrep".into()]),
+                unlist_user: Some(("alice".into(), vec!["thunderbird".into()])),
+                ..SystemChange::default()
+            },
+            what: "htop".into(),
+            adding: true,
         };
-        let github = Locked {
-            kind: "github".into(),
-            owner: Some("NixOS".into()),
-            repo: Some("nixpkgs".into()),
-            rev: Some("abc".into()),
-            ..Default::default()
-        };
-        assert_eq!(nixpkgs_ref(&[input(github)]), "github:NixOS/nixpkgs/abc");
-        let tarball = Locked {
-            kind: "tarball".into(),
-            url: Some("https://api.flakehub.com/f/pinned/NixOS/nixpkgs/0.1.1/x/source.tar.gz".into()),
-            ..Default::default()
-        };
-        assert!(nixpkgs_ref(&[input(tarball)]).starts_with("https://api.flakehub.com/"));
-        assert_eq!(nixpkgs_ref(&[]), "nixpkgs");
+        let run = change.steps(&model).remove(0)().unwrap().unwrap();
+        assert!(run.as_root);
+        assert_eq!(
+            &args(run)[1..],
+            ["change", "--packages", "htop,ripgrep", "--unlist-user", "alice:thunderbird", "--mode", "switch"]
+        );
+        assert_eq!(change.title(), "Installing htop for everyone");
+        assert!(Operation::Rollback { generation: 3 }.is_system());
         let try_it = try_command("nixpkgs", "cowsay", "cowsay", false);
         assert_eq!(try_it, ["env", "nix", "shell", "nixpkgs#cowsay", "--command", "cowsay"]);
+    }
+
+    #[test]
+    fn updates_get_ready_before_the_helper() {
+        let model = Model::default();
+        let steps = Operation::UpdateFlake { inputs: vec!["nixpkgs".into()], mode: Mode::Boot }.steps(&model);
+        if crate::cache_dir().is_some() {
+            assert_eq!(steps.len(), 3);
+        }
+        let helper = steps.into_iter().last().unwrap()().unwrap().unwrap();
+        let args = args(helper);
+        assert!(args.windows(2).any(|w| w == ["--update", "nixpkgs"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--mode", "boot"]), "{args:?}");
     }
 }

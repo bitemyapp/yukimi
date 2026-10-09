@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The window: a sidebar of places and the page for each.
+//!
+//! Nothing slow happens on the interface thread. Reading the system, the
+//! store, the package index and the sources' newest versions all happen in
+//! other threads, each filling in its part of the window when it is done.
+//! A page is built again only when something it shows has changed, and
+//! only once it is the page being looked at.
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use yukimi_config::lock::{FlakeLock, Input};
+use serde::{Deserialize, Serialize};
 use yukimi_system::index::PackageIndex;
+use yukimi_system::setup::Kind;
+use yukimi_system::updates::Release;
 
-use crate::model::Model;
-use crate::ops::{self, Operation};
+use crate::model::{Model, Store};
+use crate::ops::Operation;
 
 mod discover;
 mod history;
@@ -22,7 +31,7 @@ mod storage;
 mod updates;
 pub mod widgets;
 
-/// The places in the sidebar: (name, title, icon, explanation).
+/// The places in the sidebar: (name, title, icon).
 const PLACES: [(&str, &str, &str); 6] = [
     ("overview", "Overview", "weather-snow-symbolic"),
     ("installed", "Installed", "view-grid-symbolic"),
@@ -37,102 +46,127 @@ const PLACES: [(&str, &str, &str); 6] = [
 #[derive(Clone)]
 pub struct Ctx(Rc<Inner>);
 
-/// Rebuilds one page from the current model.
-type Refresh = Box<dyn Fn(&Ctx)>;
+/// A page's way of building itself again from the current model.
+struct Page {
+    name: &'static str,
+    refresh: Box<dyn Fn(&Ctx)>,
+    /// Something it shows has changed since it was last built.
+    stale: Cell<bool>,
+}
 
 pub struct Inner {
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     stack: adw::ViewStack,
     sidebar: gtk::ListBox,
-    model: RefCell<Rc<Model>>,
-    index: RefCell<Option<Rc<PackageIndex>>>,
+    model: RefCell<Arc<Model>>,
+    index: RefCell<Option<Arc<PackageIndex>>>,
+    /// The index loaded is for another version of Nixpkgs than the
+    /// system's, while the right one is made.
+    index_stale: Cell<bool>,
     indexing: Cell<bool>,
     updates: RefCell<Option<Rc<UpdateCheck>>>,
     checking: Cell<bool>,
+    /// Reading the configuration and generations.
     loading: Cell<bool>,
-    refreshers: RefCell<Vec<Refresh>>,
+    /// Reading the store.
+    reading_store: Cell<bool>,
+    /// Which reading is the latest, so an older one finishing late is
+    /// ignored.
+    epoch: Cell<u64>,
+    pages: RefCell<Vec<Page>>,
+    refresh_queued: Cell<bool>,
 }
 
-/// What checking for updates found: each input as `nix flake update` would
-/// lock it, why any couldn't be checked, and when it looked.
+/// What checking for updates found: the newest version of each source (or
+/// why it couldn't be asked), and when it looked.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UpdateCheck {
     pub when: i64,
-    pub inputs: Vec<Input>,
+    /// The configuration it was for: a flake's directory, or `channels`.
+    pub of: String,
+    pub newest: BTreeMap<String, Release>,
     pub failures: BTreeMap<String, String>,
+    /// Where each source came from when it was checked, so that an answer
+    /// about a source since pointed elsewhere isn't taken for the new one.
+    #[serde(default)]
+    pub sources: BTreeMap<String, String>,
 }
 
-/// Yukimi's cache directory, `~/.cache/yukimi`.
-fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("yukimi"))
+/// Where each of the system's sources comes from: what a flake's input asks
+/// for, or a channel's name.
+pub fn sources(model: &Model) -> BTreeMap<String, String> {
+    match model.setup.kind {
+        Kind::Flake => model
+            .inputs
+            .iter()
+            .filter(|i| i.follows.is_none())
+            .filter_map(|i| Some((i.name.clone(), i.original.as_ref().or(i.locked.as_ref())?.describe())))
+            .collect(),
+        Kind::Channels => model.channels.iter().map(|c| (c.name.clone(), c.release.clone())).collect(),
+    }
 }
 
-/// Where the last check for updates keeps its answers: a lock file for each
-/// input it checked (`<input>.lock`) and why others couldn't be checked.
-fn check_dir() -> Option<PathBuf> {
-    Some(cache_dir()?.join("updates"))
+/// Where the last check for updates is kept.
+fn check_file() -> Option<PathBuf> {
+    Some(crate::cache_dir()?.join("updates.json"))
 }
 
-const FAILURES: &str = "failures.json";
+fn load_check(of: &str) -> Option<UpdateCheck> {
+    let check: UpdateCheck = serde_json::from_str(&std::fs::read_to_string(check_file()?).ok()?).ok()?;
+    (check.of == of).then_some(check)
+}
 
-fn load_check(dir: &Path) -> Option<UpdateCheck> {
-    let failures_file = dir.join(FAILURES);
-    let failures: BTreeMap<String, String> =
-        serde_json::from_str(&std::fs::read_to_string(&failures_file).ok()?).ok()?;
-    let modified = std::fs::metadata(&failures_file).ok()?.modified().ok()?;
-    let when = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
-    let mut inputs = Vec::new();
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".lock")) else {
-            continue;
-        };
-        let lock = std::fs::read_to_string(&path).ok().and_then(|text| FlakeLock::parse(&text).ok());
-        if let Some(input) = lock.and_then(|lock| lock.input(name)) {
-            inputs.push(input);
+/// What the last check is about: the flake's directory, or `channels`.
+fn check_subject(model: &Model) -> String {
+    match model.setup.kind {
+        Kind::Flake => model.setup.flake(),
+        Kind::Channels => "channels".to_owned(),
+    }
+}
+
+/// Ask every source for its newest version, keeping the answers.
+fn run_check(model: &Model) -> Result<UpdateCheck, String> {
+    let answers = match model.setup.kind {
+        Kind::Flake => {
+            let scratch = crate::cache_dir().ok_or("There is no cache directory")?.join("checks");
+            let _ = std::fs::remove_dir_all(&scratch);
+            std::fs::create_dir_all(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+            let answers = yukimi_system::updates::check_flake(&model.setup.flake(), &model.inputs, &scratch);
+            let _ = std::fs::remove_dir_all(&scratch);
+            answers
+        }
+        Kind::Channels => yukimi_system::updates::check_channels(&model.channels),
+    };
+    let mut check = UpdateCheck {
+        when: yukimi_system::now(),
+        of: check_subject(model),
+        sources: sources(model),
+        ..UpdateCheck::default()
+    };
+    for (name, answer) in answers {
+        match answer {
+            Ok(release) => {
+                check.newest.insert(name, release);
+            }
+            Err(e) => {
+                check.failures.insert(name, e);
+            }
         }
     }
-    Some(UpdateCheck { when, inputs, failures })
-}
-
-/// The gist of a Nix error: its first line, without the "error:" label
-/// (`unable to download 'https://…/commits/stable': HTTP error 422`).
-fn first_line(error: &str) -> String {
-    error
-        .lines()
-        .map(|line| line.trim().trim_start_matches("error:").trim())
-        .find(|line| !line.is_empty())
-        .unwrap_or("unknown error")
-        .to_owned()
-}
-
-/// Ask Nix for the newest version of each input, keeping the answers.
-fn run_check(dir: &Path, names: &[String]) -> Result<UpdateCheck, String> {
-    let partial = dir.with_extension("new");
-    let _ = std::fs::remove_dir_all(&partial);
-    std::fs::create_dir_all(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
-    let failures: BTreeMap<String, String> =
-        yukimi_system::nix::check_updates(yukimi_system::CONFIG_DIR, names, &partial)
-            .into_iter()
-            .filter_map(|(name, result)| result.err().map(|e| (name, first_line(&e.to_string()))))
-            .collect();
     // Nothing answered (offline, say): keep the last check.
-    if !names.is_empty() && failures.len() == names.len() {
-        let _ = std::fs::remove_dir_all(&partial);
-        return Err(failures.into_values().next().unwrap_or_default());
+    if check.newest.is_empty() && !check.failures.is_empty() {
+        return Err(check.failures.into_values().next().unwrap_or_default());
     }
-    let json = serde_json::to_string_pretty(&failures).map_err(|e| e.to_string())?;
-    std::fs::write(partial.join(FAILURES), json).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir_all(dir);
-    std::fs::rename(&partial, dir).map_err(|e| e.to_string())?;
-    load_check(dir).ok_or_else(|| "The newest versions could not be read".to_owned())
+    if let Some(file) = check_file() {
+        let _ = std::fs::create_dir_all(file.parent().unwrap_or(Path::new("/")));
+        let _ = std::fs::write(&file, serde_json::to_string_pretty(&check).unwrap_or_default());
+    }
+    Ok(check)
 }
 
 impl Ctx {
-    pub fn model(&self) -> Rc<Model> {
+    pub fn model(&self) -> Arc<Model> {
         self.0.model.borrow().clone()
     }
 
@@ -140,8 +174,13 @@ impl Ctx {
         &self.0.window
     }
 
-    pub fn index(&self) -> Option<Rc<PackageIndex>> {
+    pub fn index(&self) -> Option<Arc<PackageIndex>> {
         self.0.index.borrow().clone()
+    }
+
+    /// Whether the index loaded is for an older Nixpkgs than the system's.
+    pub fn index_stale(&self) -> bool {
+        self.0.index_stale.get()
     }
 
     pub fn indexing(&self) -> bool {
@@ -157,25 +196,30 @@ impl Ctx {
         self.0.checking.get()
     }
 
-    /// Look for newer versions of the system's inputs, in the background.
+    pub fn loading(&self) -> bool {
+        self.0.loading.get()
+    }
+
+    /// Check for updates when the last check is older than a few minutes (or
+    /// there hasn't been one), as when the Updates page is opened: asking
+    /// takes a second, and a commit pushed a moment ago should show.
+    pub fn check_if_stale(&self) {
+        let model = self.model();
+        let stale = self.update_check().is_none_or(|c| yukimi_system::now() - c.when > 10 * 60);
+        if stale && !self.loading() && (!model.inputs.is_empty() || !model.channels.is_empty()) {
+            self.check_updates();
+        }
+    }
+
+    /// Look for newer versions of the system's sources, in the background.
     pub fn check_updates(&self) {
-        let Some(dir) = check_dir() else {
-            return;
-        };
-        let names: Vec<String> = self
-            .model()
-            .inputs
-            .iter()
-            .filter(|input| input.follows.is_none() && input.locked.is_some())
-            .map(|input| input.name.clone())
-            .collect();
         if self.0.checking.replace(true) {
             return;
         }
-        self.refresh_all();
-        let ctx = self.clone();
+        self.changed();
+        let (ctx, model) = (self.clone(), self.model());
         glib::spawn_future_local(async move {
-            let checked = gio::spawn_blocking(move || run_check(&dir, &names))
+            let checked = gio::spawn_blocking(move || run_check(&model))
                 .await
                 .unwrap_or_else(|_| Err("Checking for updates stopped unexpectedly".to_owned()));
             ctx.0.checking.set(false);
@@ -183,24 +227,45 @@ impl Ctx {
                 Ok(check) => *ctx.0.updates.borrow_mut() = Some(Rc::new(check)),
                 Err(e) => ctx.toast(&format!("Couldn't check for updates: {e}")),
             }
-            ctx.refresh_all();
+            ctx.changed();
         });
     }
 
-    pub fn loading(&self) -> bool {
-        self.0.loading.get()
+    /// Build `refresh` into the page named `name` now, and again whenever
+    /// something changes while it is shown (or once it is shown again).
+    pub fn on_refresh(&self, name: &'static str, refresh: impl Fn(&Ctx) + 'static) {
+        self.0.pages.borrow_mut().push(Page { name, refresh: Box::new(refresh), stale: Cell::new(true) });
+        self.queue_refresh();
     }
 
-    /// Run `refresh` now and whenever the model or index changes.
-    pub fn on_refresh(&self, refresh: impl Fn(&Ctx) + 'static) {
-        refresh(self);
-        self.0.refreshers.borrow_mut().push(Box::new(refresh));
+    /// Something pages show has changed: the page in view is built again
+    /// soon (once, however many changes come together), the others when
+    /// they are next shown.
+    pub fn changed(&self) {
+        for page in self.0.pages.borrow().iter() {
+            page.stale.set(true);
+        }
+        self.queue_refresh();
     }
 
-    fn refresh_all(&self) {
-        let refreshers = self.0.refreshers.borrow();
-        for refresh in refreshers.iter() {
-            refresh(self);
+    fn queue_refresh(&self) {
+        if self.0.refresh_queued.replace(true) {
+            return;
+        }
+        let ctx = self.clone();
+        glib::idle_add_local_once(move || {
+            ctx.0.refresh_queued.set(false);
+            ctx.refresh_visible();
+        });
+    }
+
+    fn refresh_visible(&self) {
+        let visible = self.0.stack.visible_child_name();
+        let pages = self.0.pages.borrow();
+        for page in pages.iter().filter(|p| Some(p.name) == visible.as_deref() && p.stale.get()) {
+            page.stale.set(false);
+            let _busy = crate::stalls::doing(page.name);
+            (page.refresh)(self);
         }
     }
 
@@ -218,25 +283,61 @@ impl Ctx {
         }
     }
 
-    /// Read everything again, away from the interface.
+    /// Read everything again, away from the interface: the configuration
+    /// and generations first, then the store. What was shown stays until
+    /// its new version is read.
     pub fn reload(&self) {
-        if self.0.loading.replace(true) {
-            return;
-        }
-        self.refresh_all();
+        let epoch = self.0.epoch.get() + 1;
+        self.0.epoch.set(epoch);
+        self.0.loading.set(true);
+        self.changed();
         let ctx = self.clone();
         glib::spawn_future_local(async move {
-            let model = gio::spawn_blocking(Model::load).await.unwrap_or_default();
-            *ctx.0.model.borrow_mut() = Rc::new(model);
+            let mut model = gio::spawn_blocking(Model::quick).await.unwrap_or_default();
+            if ctx.0.epoch.get() != epoch {
+                return;
+            }
+            model.store = ctx.model().store.clone();
+            let flake_nixpkgs =
+                (model.nixpkgs.is_none() && model.setup.kind == Kind::Flake).then(|| model.setup.flake());
+            let generations = model.generations.clone();
+            if ctx.0.updates.borrow().is_none() {
+                *ctx.0.updates.borrow_mut() = load_check(&check_subject(&model)).map(Rc::new);
+            }
+            *ctx.0.model.borrow_mut() = Arc::new(model);
             ctx.0.loading.set(false);
-            ctx.refresh_all();
+            ctx.0.reading_store.set(true);
+            ctx.changed();
             ctx.ensure_index(false);
-        });
-    }
 
-    /// The flake reference packages are installed from.
-    pub fn nixpkgs_ref(&self) -> String {
-        ops::nixpkgs_ref(&self.model().inputs)
+            // A flake whose facts don't say which Nixpkgs it uses: ask Nix.
+            if let Some(flake) = flake_nixpkgs {
+                let ctx = ctx.clone();
+                glib::spawn_future_local(async move {
+                    let found = gio::spawn_blocking(move || yukimi_system::nix::flake_nixpkgs(&flake)).await;
+                    if ctx.0.epoch.get() != epoch {
+                        return;
+                    }
+                    if let Ok(Ok(path)) = found {
+                        let model = Model { nixpkgs: Some(path), ..(*ctx.model()).clone() };
+                        *ctx.0.model.borrow_mut() = Arc::new(model);
+                        ctx.changed();
+                        ctx.ensure_index(false);
+                    }
+                });
+            }
+
+            let (store, problems) = gio::spawn_blocking(move || Store::load(&generations))
+                .await
+                .unwrap_or_else(|_| (Store::default(), vec!["The store could not be read".to_owned()]));
+            if ctx.0.epoch.get() != epoch {
+                return;
+            }
+            let model = ctx.model().with_store(store, problems);
+            *ctx.0.model.borrow_mut() = Arc::new(model);
+            ctx.0.reading_store.set(false);
+            ctx.changed();
+        });
     }
 
     /// Run an operation in a progress dialog, then read everything again.
@@ -260,64 +361,62 @@ impl Ctx {
         dialog.present(Some(self.window()));
     }
 
-    /// Where the package index for the system's Nixpkgs is cached.
-    fn index_cache(&self) -> Option<PathBuf> {
-        let nixpkgs = self.model().nixpkgs.clone()?;
-        let name = std::path::Path::new(&nixpkgs).file_name()?.to_string_lossy().into_owned();
-        Some(cache_dir()?.join(format!("packages-{name}.json")))
-    }
-
-    /// Load the package index from the cache, or build it (`build` forces a
-    /// rebuild; otherwise it is built only when missing).
+    /// Load the package index for the system's Nixpkgs, or make it (`build`
+    /// makes it again even when there is one). While it is made, the index
+    /// of an earlier Nixpkgs serves, if there is one. Made only once the
+    /// Discover page has been shown, since it takes a minute and a few
+    /// gigabytes of memory.
     pub fn ensure_index(&self, build: bool) {
-        if self.0.indexing.get() || (self.index().is_some() && !build) {
+        let wanted = self.0.stack.visible_child_name().as_deref() == Some("discover") || self.index().is_some();
+        if self.0.indexing.get() || !wanted || (self.index().is_some() && !self.index_stale() && !build) {
             return;
         }
-        let (Some(cache), Some(nixpkgs)) = (self.index_cache(), self.model().nixpkgs.clone()) else {
+        let Some(nixpkgs) = self.model().nixpkgs.clone() else {
+            return;
+        };
+        let Some(cache) = crate::cache_dir() else {
             return;
         };
         self.0.indexing.set(true);
-        self.refresh_all();
+        self.changed();
         let ctx = self.clone();
         glib::spawn_future_local(async move {
-            let loaded = gio::spawn_blocking(move || load_or_build_index(&cache, &nixpkgs, build))
-                .await
-                .unwrap_or_else(|_| Err("The package index could not be built".to_owned()));
-            ctx.0.indexing.set(false);
-            match loaded {
-                Ok(index) => *ctx.0.index.borrow_mut() = Some(Rc::new(index)),
-                Err(e) => ctx.toast(&e),
+            let (load_cache, load_nixpkgs) = (cache.clone(), nixpkgs.clone());
+            // What is cached comes first: this Nixpkgs's index, or an older one
+            // to use while this one is made.
+            let cached = if build {
+                None
+            } else {
+                gio::spawn_blocking(move || yukimi_system::index::load_cached(&load_cache, &load_nixpkgs))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let current = match cached {
+                Some((index, current)) => {
+                    *ctx.0.index.borrow_mut() = Some(Arc::new(index));
+                    ctx.0.index_stale.set(!current);
+                    ctx.changed();
+                    current
+                }
+                None => false,
+            };
+            if !current {
+                let made = gio::spawn_blocking(move || yukimi_system::index::make(&cache, &nixpkgs))
+                    .await
+                    .unwrap_or_else(|_| Err("The package list could not be made".to_owned()));
+                match made {
+                    Ok(index) => {
+                        *ctx.0.index.borrow_mut() = Some(Arc::new(index));
+                        ctx.0.index_stale.set(false);
+                    }
+                    Err(e) => ctx.toast(&e),
+                }
             }
-            ctx.refresh_all();
+            ctx.0.indexing.set(false);
+            ctx.changed();
         });
     }
-}
-
-fn load_or_build_index(cache: &std::path::Path, nixpkgs: &str, build: bool) -> Result<PackageIndex, String> {
-    if !build
-        && let Ok(text) = std::fs::read_to_string(cache)
-        && let Ok(index) = PackageIndex::parse(&text)
-    {
-        return Ok(index);
-    }
-    let expression = yukimi_system::index::expression(nixpkgs);
-    let output = yukimi_system::nix::command()
-        .args(["eval", "--json", "--impure", "--expr", &expression])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("Nix could not be started: {e}"))?;
-    if !output.status.success() {
-        let stderr = yukimi_system::log::strip_ansi(&String::from_utf8_lossy(&output.stderr));
-        return Err(yukimi_system::nix::last_error(&stderr));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let index = PackageIndex::parse(&text).map_err(|e| format!("The package list could not be read: {e}"))?;
-    if let Some(dir) = cache.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(cache, text.as_bytes());
-    Ok(index)
 }
 
 /// The sidebar's brand: the name, its meaning, and a snowflake.
@@ -349,6 +448,10 @@ pub fn build_window(app: &adw::Application) {
         .default_height(800)
         .build();
     let stack = adw::ViewStack::new();
+    // Sized by the page in view alone: otherwise every page, even one not
+    // shown, is measured whenever any of them changes.
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&stack));
     let sidebar = gtk::ListBox::new();
@@ -358,13 +461,17 @@ pub fn build_window(app: &adw::Application) {
         toasts: toasts.clone(),
         stack: stack.clone(),
         sidebar: sidebar.clone(),
-        model: RefCell::new(Rc::new(Model::default())),
+        model: RefCell::new(Arc::new(Model::default())),
         index: RefCell::new(None),
+        index_stale: Cell::new(false),
         indexing: Cell::new(false),
-        updates: RefCell::new(check_dir().and_then(|dir| load_check(&dir)).map(Rc::new)),
+        updates: RefCell::new(None),
         checking: Cell::new(false),
-        loading: Cell::new(false),
-        refreshers: RefCell::new(Vec::new()),
+        loading: Cell::new(true),
+        reading_store: Cell::new(true),
+        epoch: Cell::new(0),
+        pages: RefCell::new(Vec::new()),
+        refresh_queued: Cell::new(false),
     }));
 
     let pages: [(&str, gtk::Widget); 6] = [
@@ -401,6 +508,17 @@ pub fn build_window(app: &adw::Application) {
                 stack.set_visible_child_name(name);
                 content_title.set_title(title);
                 content_page.set_title(title);
+            }
+        });
+    }
+    {
+        // A page that changed while hidden is built when it is shown.
+        let ctx = ctx.clone();
+        stack.connect_visible_child_name_notify(move |stack| {
+            ctx.queue_refresh();
+            ctx.ensure_index(false);
+            if stack.visible_child_name().as_deref() == Some("updates") {
+                ctx.check_if_stale();
             }
         });
     }

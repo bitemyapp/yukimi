@@ -6,7 +6,7 @@ use yukimi_store::RootKind;
 use yukimi_system::human_size;
 
 use super::Ctx;
-use super::widgets::{clear, dim, heading, page, share_bar};
+use super::widgets::{clear, dim, fill_later, heading, page, pending_row, share_bar};
 use crate::model::Composition;
 use crate::ops::Operation;
 
@@ -90,15 +90,21 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
     content.set_margin_start(18);
     content.set_margin_end(18);
     let scroll = page(&content);
-    ctx.on_refresh(move |ctx| {
+    ctx.on_refresh("storage", move |ctx| {
         clear(&content);
         let model = ctx.model();
-        let c = &model.composition;
         content.append(&heading(
             "The Nix store",
             "Everything installed lives in /nix/store, each version in its own folder, which is why several can \
              live side by side and why going back is instant. Here is what keeps each part of it.",
         ));
+        let Some(store) = model.store.clone() else {
+            let group = adw::PreferencesGroup::new();
+            group.add(&pending_row("Reading the store…"));
+            content.append(&group);
+            return;
+        };
+        let c = &store.composition;
         let size = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let total = gtk::Label::new(Some(&human_size(c.total)));
         total.add_css_class("stat-number");
@@ -172,8 +178,8 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
         // The heaviest packages.
         let heavy = adw::PreferencesGroup::new();
         heavy.set_title("Heaviest in the running system");
-        let largest = model.heaviest.first().map(|h| h.size).unwrap_or(1).max(1);
-        for package in &model.heaviest {
+        let largest = store.heaviest.first().map(|h| h.size).unwrap_or(1).max(1);
+        for package in &store.heaviest {
             let row = adw::ActionRow::new();
             row.set_title(&package.name);
             if !package.version.is_empty() {
@@ -190,15 +196,28 @@ pub fn build(ctx: &Ctx) -> gtk::ScrolledWindow {
         roots.set_title("What keeps things in the store");
         roots.set_description(Some("Garbage-collector roots: links to store paths that keep them and all they need."));
         let expander = adw::ExpanderRow::new();
-        expander.set_title(&format!("{} roots", model.roots.len()));
-        for root in &model.roots {
-            let row = adw::ActionRow::new();
-            row.set_title(&root_kind(&root.kind));
-            row.set_subtitle(&root.link.display().to_string());
-            row.set_subtitle_selectable(true);
-            row.set_tooltip_markup(Some(&super::widgets::store_path_markup(root.target.as_str())));
-            expander.add_row(&row);
-        }
+        expander.set_title(&format!("{} roots", store.roots.len()));
+        // Built when opened, a batch at a time: there can be thousands.
+        let (filled, store) = (std::cell::Cell::new(false), store.clone());
+        expander.connect_expanded_notify(move |expander| {
+            if !expander.is_expanded() || filled.replace(true) {
+                return;
+            }
+            let list = expander.clone();
+            fill_later(
+                expander,
+                store.roots.clone(),
+                |root| {
+                    let row = adw::ActionRow::new();
+                    row.set_title(&root_kind(&root.kind));
+                    row.set_subtitle(&root.link.display().to_string());
+                    row.set_subtitle_selectable(true);
+                    row.set_tooltip_markup(Some(&super::widgets::store_path_markup(root.target.as_str())));
+                    row
+                },
+                move |row| list.add_row(row),
+            );
+        });
         roots.add(&expander);
         content.append(&roots);
     });

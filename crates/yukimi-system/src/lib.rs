@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! A NixOS system as a person sees it.
 //!
+//! - [`setup`]: how the system is configured: a flake or channels, where,
+//!   and which file Yukimi adds its own to.
 //! - [`info`]: this computer: its name, NixOS release, kernel, and whether a
 //!   restart would finish an update.
 //! - [`generations`]: every version of the system (and of a user's
 //!   packages) that can be returned to.
 //! - [`diff`]: what changed between two of them, package by package.
 //! - [`profile`]: packages a user installed for themselves.
-//! - [`catalog`]: the installer's curated applications.
+//! - [`catalog`]: well-known applications to offer, Yukimi's and the
+//!   system's.
+//! - [`channels`]: where a system without a flake gets Nixpkgs from.
+//! - [`updates`]: whether the system's sources have newer versions, and
+//!   getting an update ready without administrator rights.
 //! - [`index`]: every package in Nixpkgs, searchable.
 //! - [`log`]: Nix's progress while it downloads and builds.
 //! - [`nix`]: running Nix itself.
 pub mod catalog;
+pub mod channels;
 pub mod diff;
 pub mod generations;
 pub mod index;
@@ -19,6 +26,8 @@ pub mod info;
 pub mod log;
 pub mod nix;
 pub mod profile;
+pub mod setup;
+pub mod updates;
 
 /// The directory a NixOS system is configured in.
 pub const CONFIG_DIR: &str = "/etc/nixos";
